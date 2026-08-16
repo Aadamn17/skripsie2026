@@ -39,13 +39,6 @@ class ResNet18(nn.Module):
         self.resnet = resnet18() 
         self.resnet.fc = nn.Linear(512, num_classes) 
 
-class EarlyFuser(nn.Module):
-    '''input dimensions = num freq bins
-    Example usage: fuser = TensorFuser(tensors=[sensor_a_features, sensor_b_features])'''
-
-    def __init__(self,input_dim=128,num_classes=2):
-        super(EarlyFuser,self).___init__()
-        self.early = EarlyFuser
 def train_validate(train_data, dev_data, test_data, model, params):
     """
     Training and evaluating logic for the model

@@ -14,7 +14,8 @@ grid = {
     'learning_rate': [1e-4],
     'weight_decay': [1e-4],
     'dataset': ["cage"], # Datasets: "hyfe" or "cage"
-    'arch': ["resnet"] # Architectures: "lr" or "resnet"
+    'arch': ["resnet"], # Architectures: "lr" or "resnet"
+    'fusion': ["early"], # Fusion strategies: "early" or "intermediate" or "late" or "none"
 }
 
 # Log file to keep track of losses and accuracies
@@ -50,10 +51,29 @@ def main(grid):
         # Exclude the same experiments for the test and dev set
         if not params['test_set'] == params['dev_set']:
             
-            # Get train, validation and test set data for Hyfe or Cage
-            train_data, val_data, test_data = get_cough_data(dataset=params['dataset'], data_folds="data/"+params['dataset']+"/data_folds", i=params['test_set'], j=params['dev_set'], cough_dir="data/"+params['dataset']+"/"+image_type_features, loss=params['loss_selected'], batch_size=params['batch_size'], num_outer_folds=10)
-            
-            # Train and validate the model to get the development and test accuracies and AUCs
+            if params['fusion'] == "none":
+                train_data, val_data, test_data = get_cough_data(
+                    dataset=params['dataset'],
+                    data_folds="data/"+params['dataset']+"/data_folds_filtered",
+                    i=params['test_set'],
+                    j=params['dev_set'],
+                    cough_dir="data/"+params['dataset']+"/"+image_type_features,
+                    loss=params['loss_selected'],
+                    batch_size=params['batch_size'],
+                    num_outer_folds=10
+                )
+            elif params['fusion'] == "early":
+                train_data, val_data, test_data = get_early_fusion_data(
+                    dataset=params['dataset'],
+                    data_folds="data/"+params['dataset']+"/data_folds_filtered",
+                    i=params['test_set'],
+                    j=params['dev_set'],
+                    cough_dir="data/"+params['dataset']+"/"+image_type_features,
+                    speech_dir="data/"+params['dataset']+"/mel_spectrograms_counting_128",
+                    loss=params['loss_selected'],
+                    batch_size=params['batch_size'],
+                    num_outer_folds=10
+                )
             if params['loss_selected']== "cross_entropy": model = Logistic_Regression(bins, num_classes).to(device) 
             elif params['loss_selected']== "cross_entropy_resnet": model = ResNet18(num_classes=num_classes).resnet.to(device)
             

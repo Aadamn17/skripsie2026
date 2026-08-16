@@ -1,7 +1,7 @@
 import os
 '''
 # Replace with your directory path
-target_directory = "/data/cage/mel_spectograms_counting_128"  # Change this to the directory you want to count folders in
+target_directory = "/data/cage/mel_spectograms_counting_128"  
 
 # Count all folders recursively
 folder_count = sum(len(dirs) for _, dirs, _ in os.walk(target_directory))
@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 
 # 1. Set your path here
-target_input = "../data/cage/mel_spectograms_counting_128"
+target_input = "/data/cage/mel_spectrograms_counting_128"
 
 # 2. Convert to absolute path to see exactly where Python is looking
 path = Path(target_input).resolve()
