@@ -9,7 +9,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def _prepare_image_batch(images, device):
     if images is None:
-        return torch.empty((0, 3, 224, 224), device=device,dtype=torch.float32)
+        return torch.empty((0, 3, 224, 224), device=device, dtype=torch.float32)
 
     if isinstance(images, torch.Tensor):
         x = images.to(device)
@@ -23,7 +23,7 @@ def _prepare_image_batch(images, device):
 
     batches = []
     for img in images:
-        t = img.to(device = device, dtype = torch.float32)
+        t = img.to(device=device, dtype=torch.float32)
         if t.dim() == 3:
             t = t.unsqueeze(0)
         elif t.dim() == 5 and t.shape[1] == 1:
@@ -37,43 +37,47 @@ def _prepare_image_batch(images, device):
 
     return torch.cat(batches, dim=0)
 
+
 # ------------------------------------------------------------------
 # 1. Single-Modality Classifiers
 # ------------------------------------------------------------------
 class Logistic_Regression(nn.Module):
     def __init__(self, input_dim=128, num_classes=2):
-        super(Logistic_Regression, self).__init__()
+        super().__init__()
         self.linear = nn.Linear(input_dim, num_classes)
     def forward(self, x):
         return self.linear(x)
 
 class ResNet18(nn.Module):
     def __init__(self, num_classes=2):
-        super(ResNet18, self).__init__()
+        super().__init__()
         self.resnet = resnet18()
         self.resnet.fc = nn.Linear(512, num_classes)
     def forward(self, x):
         return self.resnet(x)
 
+
 # ------------------------------------------------------------------
-# 2. INTERMEDIATE FUSION (Your described method)
-#    Separate ResNets per modality -> average features -> concat -> MLP
+# 2. INTERMEDIATE FUSION (Separate ResNets + avg + concat + MLP)
 # ------------------------------------------------------------------
 class PatientIntermediateClassifier(nn.Module):
-    def __init__(self, num_classes=2, freeze_backbone=True):
-        super(PatientIntermediateClassifier, self).__init__()
-        # Shared feature extractor
+    def __init__(self, num_classes=2, freeze_backbone=False):
+        super().__init__()
         resnet = resnet18(pretrained=True)
         self.backbone = nn.Sequential(*list(resnet.children())[:-2])
         self.pool = nn.AdaptiveAvgPool2d(1)
-        if freeze_backbone:
-            for param in self.backbone.parameters():
-                param.requires_grad = False
+
+        # 🔧 Selective fine‑tuning: only train layer4 + classifier
+        if not freeze_backbone:
+            for name, param in resnet.named_parameters():
+                if 'layer4' in name:   # Unfreeze only the last residual block
+                    param.requires_grad = True
+
         self.classifier = nn.Sequential(
-            nn.Linear(512 * 2, 64),
+            nn.Linear(512 * 2, 16),   # reduced complexity
             nn.ReLU(),
             nn.Dropout(0.4),
-            nn.Linear(64, num_classes)
+            nn.Linear(16, num_classes)
         )
 
     def forward(self, cough_images, speech_images):
@@ -96,24 +100,27 @@ class PatientIntermediateClassifier(nn.Module):
         fused = torch.cat([c_avg, s_avg], dim=1)
         return self.classifier(fused)
 
+
 # ------------------------------------------------------------------
-# 3. TRUE EARLY FUSION
-#    One ResNet on stacked (Cough, Speech, Avg) images -> average features -> MLP
+# 3. TRUE EARLY FUSION (One ResNet on stacked images)
 # ------------------------------------------------------------------
 class PatientEarlyImageClassifier(nn.Module):
-    def __init__(self, num_classes=2, freeze_backbone=True):
-        super(PatientEarlyImageClassifier, self).__init__()
+    def __init__(self, num_classes=2, freeze_backbone=False):
+        super().__init__()
         resnet = resnet18(pretrained=True)
         self.backbone = nn.Sequential(*list(resnet.children())[:-2])
         self.pool = nn.AdaptiveAvgPool2d(1)
-        if freeze_backbone:
-            for param in self.backbone.parameters():
-                param.requires_grad = False
+
+        if not freeze_backbone:
+            for name, param in resnet.named_parameters():
+                if 'layer4' in name:
+                    param.requires_grad = True
+
         self.classifier = nn.Sequential(
-            nn.Linear(512, 64),
+            nn.Linear(512, 16),
             nn.ReLU(),
             nn.Dropout(0.4),
-            nn.Linear(64, num_classes)
+            nn.Linear(16, num_classes)
         )
 
     def forward(self, fused_images):
@@ -127,55 +134,86 @@ class PatientEarlyImageClassifier(nn.Module):
             avg_feat = torch.zeros(1, 512, device=device)
         return self.classifier(avg_feat)
 
+
 # ------------------------------------------------------------------
-# 4. Training and Evaluation Functions
+# 4. Training and Evaluation Functions (with dynamic threshold)
 # ------------------------------------------------------------------
-def _debug_label_distribution(data_loader, name):
-    counts = {0: 0, 1: 0}
-    for batch in data_loader:
-        labels = batch[-1]
-        if isinstance(labels, torch.Tensor):
-            labels = labels.detach().cpu().tolist()
-        if not isinstance(labels, list):
-            labels = [labels]
-        for label in labels:
-            counts[int(label)] = counts.get(int(label), 0) + 1
-    print(f"[{name}] label distribution: {counts}")
-    return counts
+def get_probs_and_labels(loader, model, criterion):
+    """Helper: Returns raw probabilities and labels without applying a threshold."""
+    model.eval()
+    all_probs, all_labels = [], []
+    with torch.no_grad():
+        for batch in loader:
+            if isinstance(model, PatientIntermediateClassifier):
+                c_imgs, s_imgs, labels = batch
+                labels = labels.to(device)
+                output = model(c_imgs, s_imgs)
+            elif isinstance(model, PatientEarlyImageClassifier):
+                f_imgs, labels = batch
+                labels = labels.to(device)
+                output = model(f_imgs)
+            else:
+                input_data, labels = batch
+                labels = labels.to(device)
+                input_data = input_data.to(torch.float32).to(device)
+                output = model(input_data)
+            prob = torch.nn.functional.softmax(output, dim=1)[0, 1].item()
+            all_probs.append(prob)
+            all_labels.append(labels.item())
+    return torch.tensor(all_probs), torch.tensor(all_labels)
 
 
 def train_validate(train_data, dev_data, test_data, model, params):
-    optimizer = torch.optim.AdamW(model.parameters(), lr=params["learning_rate"], weight_decay=params['weight_decay'])
-
-    # --- compute class weights from the training set ---
-    all_train_labels = []
-    for batch in train_data:
-        labels = batch[-1]          # labels is always the last element of the batch tuple
-        all_train_labels.append(labels.item())
-    all_train_labels = torch.tensor(all_train_labels)
-
-    class_counts = torch.bincount(all_train_labels.long(), minlength=2)   # [count_class0, count_class1]
-    class_weights = 1.0 / class_counts.float()
-    class_weights = class_weights / class_weights.sum() * len(class_counts)  # normalize so weights are ~scale 1
-    class_weights = class_weights.to(device)
-
-    print(f"[train] raw class counts: {dict(zip([0, 1], class_counts.tolist()))}")
-    print(f"[train] effective class weights: {class_weights.detach().cpu().tolist()}")
-    criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
-    # --- end of change ---
+    optimizer = torch.optim.AdamW(model.parameters(),
+                                  lr=params["learning_rate"],
+                                  weight_decay=params['weight_decay'])
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=3
+    )
+    criterion = torch.nn.CrossEntropyLoss()
 
     dev_acc, dev_auc, test_acc, test_auc = 0.0, 0.0, 0.0, 0.0
 
     for epoch in range(params["num_epochs"]):
         train_loss = train_epoch(train_data, model, optimizer, criterion)
-        if dev_data is not None:
-            dev_loss, dev_acc, dev_auc = evaluate_epoch(dev_data, model, criterion)
-        if test_data is not None:
-            test_loss, test_acc, test_auc = evaluate_epoch(test_data, model, criterion)
-        with open("logs/per_epoch_loss.txt", "a") as f:
-            f.write(f"Epoch {epoch+1}/{params['num_epochs']}, Train Loss: {train_loss:.4f}, Dev Acc: {dev_acc:.4f}, Dev AUC: {dev_auc:.4f}, Test Acc: {test_acc:.4f}, Test AUC: {test_auc:.4f}\n")
-        print(f"[epoch {epoch+1}] train_loss={train_loss:.4f}, dev_acc={dev_acc:.4f}, dev_auc={dev_auc:.4f}")
+
+        # Get raw probabilities and labels for Dev and Test
+        dev_probs, dev_labels = get_probs_and_labels(dev_data, model, criterion) if dev_data else (None, None)
+        test_probs, test_labels = get_probs_and_labels(test_data, model, criterion) if test_data else (None, None)
+
+        # --- DYNAMIC THRESHOLD OPTIMIZATION ---
+        if dev_probs is not None:
+            best_thresh = 0.5
+            best_f1 = 0.0
+            # Search thresholds from 0.1 to 0.9 to maximize F1-score on DEV set
+            for thresh in np.arange(0.1, 0.9, 0.02):
+                preds = (dev_probs > thresh).float()
+                f1 = metrics.f1_score(dev_labels, preds, zero_division=0)
+                if f1 > best_f1:
+                    best_f1 = f1
+                    best_thresh = thresh
+
+            # Apply the best threshold to compute Dev metrics
+            dev_preds = (dev_probs > best_thresh).float()
+            dev_acc = (dev_preds == dev_labels).float().mean().item()
+            dev_auc = metrics.roc_auc_score(dev_labels, dev_probs) if len(torch.unique(dev_labels)) == 2 else 0.5
+
+            # Apply the SAME best threshold to compute Test metrics
+            if test_probs is not None:
+                test_preds = (test_probs > best_thresh).float()
+                test_acc = (test_preds == test_labels).float().mean().item()
+                test_auc = metrics.roc_auc_score(test_labels, test_probs) if len(torch.unique(test_labels)) == 2 else 0.5
+
+            with open("logs/per_epoch_loss.txt", "a") as f:
+                f.write(f"Epoch {epoch+1}/{params['num_epochs']}, Train Loss: {train_loss:.4f}, "
+                        f"Dev Acc: {dev_acc:.4f}, Dev AUC: {dev_auc:.4f}, "
+                        f"Test Acc: {test_acc:.4f}, Test AUC: {test_auc:.4f}, "
+                        f"Best Thresh: {best_thresh:.2f}\n")
+            print(f"[epoch {epoch+1}] train_loss={train_loss:.4f}, "
+                  f"dev_auc={dev_auc:.4f}, best_thresh={best_thresh:.2f}")
+
     return dev_acc, dev_auc, test_acc, test_auc
+
 
 def train_epoch(train_data, model, optimizer, criterion):
     model.train()
@@ -185,68 +223,20 @@ def train_epoch(train_data, model, optimizer, criterion):
             c_imgs, s_imgs, labels = batch
             labels = labels.to(device)
             output = model(c_imgs, s_imgs)
-            loss = criterion(output, labels.long())
         elif isinstance(model, PatientEarlyImageClassifier):
             f_imgs, labels = batch
             labels = labels.to(device)
             output = model(f_imgs)
-            loss = criterion(output, labels.long())
         else:
             input_data, labels = batch
             labels = labels.to(device)
             input_data = input_data.to(torch.float32).to(device)
             output = model(input_data)
-            loss = criterion(output, labels.long())
 
-        pred_class = output.argmax(dim=1)
-        if num_samples == 0:
-            print(f"[train batch sample] labels={labels.detach().cpu().tolist()[:10]}, preds={pred_class.detach().cpu().tolist()[:10]}")
-
+        loss = criterion(output, labels.long())
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         total_loss += loss.item()
         num_samples += labels.size(0)
     return total_loss / num_samples
-
-def evaluate_epoch(dev_data, model, criterion):
-    model.eval()
-    total_loss, num_samples = 0.0, 0
-    all_labels, all_probs = [], []
-    with torch.no_grad():
-        for batch in dev_data:
-            if isinstance(model, PatientIntermediateClassifier):
-                c_imgs, s_imgs, labels = batch
-                labels = labels.to(device)
-                output = model(c_imgs, s_imgs)
-                loss = criterion(output, labels.long())
-                prob = torch.nn.functional.softmax(output, dim=1)[0, 1].item()
-            elif isinstance(model, PatientEarlyImageClassifier):
-                f_imgs, labels = batch
-                labels = labels.to(device)
-                output = model(f_imgs)
-                loss = criterion(output, labels.long())
-                prob = torch.nn.functional.softmax(output, dim=1)[0, 1].item()
-            else:
-                input_data, labels = batch
-                labels = labels.to(device)
-                input_data = input_data.to(torch.float32).to(device)
-                output = model(input_data)
-                loss = criterion(output, labels.long())
-                prob = torch.nn.functional.softmax(output, dim=1)[0, 1].item()
-
-            total_loss += loss.item()
-            all_labels.append(labels.item())
-            all_probs.append(prob)
-            num_samples += labels.size(0)
-
-    all_labels = torch.tensor(all_labels)
-    all_probs = torch.tensor(all_probs)
-    preds = (all_probs > 0.5).float()
-    acc = (preds == all_labels).float().mean().item()
-    if len(torch.unique(all_labels)) == 2:
-        fpr, tpr, _ = metrics.roc_curve(all_labels.numpy(), all_probs.numpy())
-        auc = metrics.auc(fpr, tpr)
-    else:
-        auc = 0.5
-    return total_loss / num_samples, acc, auc

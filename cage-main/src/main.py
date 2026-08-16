@@ -62,7 +62,7 @@ def main(grid):
                 loss=point['loss_selected'], batch_size=point['batch_size'],
                 num_outer_folds=10
             )
-            model = PatientIntermediateClassifier(num_classes=2).to(device)
+            model = PatientIntermediateClassifier(num_classes=2,freeze_backbone=False).to(device)
 
         elif point['fusion'] == "early_image":
             train, val, test = get_early_image_data(
@@ -72,7 +72,7 @@ def main(grid):
                 loss=point['loss_selected'], batch_size=point['batch_size'],
                 num_outer_folds=10
             )
-            model = PatientEarlyImageClassifier(num_classes=2).to(device)
+            model = PatientEarlyImageClassifier(num_classes=2,freeze_backbone=False).to(device)
 
         else:
             raise ValueError(f"Unknown fusion method: {point['fusion']}")
