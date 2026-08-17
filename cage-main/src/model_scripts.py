@@ -172,7 +172,8 @@ def train_validate(train_data, dev_data, test_data, model, params):
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=3
     )
-    criterion = torch.nn.CrossEntropyLoss()
+
+    # --- compute class weights from the training set ---
     all_train_labels = []
     for batch in train_data:
         all_train_labels.append(batch[-1].item())
@@ -181,45 +182,45 @@ def train_validate(train_data, dev_data, test_data, model, params):
     class_weights = (1.0 / class_counts.float())
     class_weights = (class_weights / class_weights.sum() * len(class_counts)).to(device)
     criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
+
     dev_acc, dev_auc, test_acc, test_auc = 0.0, 0.0, 0.0, 0.0
 
     for epoch in range(params["num_epochs"]):
         train_loss = train_epoch(train_data, model, optimizer, criterion)
 
-        # Get raw probabilities and labels for Dev and Test
+        # Get raw probabilities and labels for Train, Dev and Test
+        train_probs, train_labels = get_probs_and_labels(train_data, model, criterion)
         dev_probs, dev_labels = get_probs_and_labels(dev_data, model, criterion) if dev_data else (None, None)
         test_probs, test_labels = get_probs_and_labels(test_data, model, criterion) if test_data else (None, None)
 
-        # --- DYNAMIC THRESHOLD OPTIMIZATION ---
-        if dev_probs is not None:
-            best_thresh = 0.5
-            best_f1 = 0.0
-            # Search thresholds from 0.1 to 0.9 to maximize F1-score on DEV set
-            for thresh in np.arange(0.1, 0.9, 0.02):
-                preds = (dev_probs > thresh).float()
-                f1 = metrics.f1_score(dev_labels, preds, zero_division=0)
-                if f1 > best_f1:
-                    best_f1 = f1
-                    best_thresh = thresh
+        # --- THRESHOLD SELECTION ON TRAIN, NOT DEV ---
+        best_thresh = 0.5
+        best_f1 = 0.0
+        for thresh in np.arange(0.1, 0.9, 0.02):
+            preds = (train_probs > thresh).float()
+            f1 = metrics.f1_score(train_labels, preds, zero_division=0)
+            if f1 > best_f1:
+                best_f1 = f1
+                best_thresh = thresh
 
-            # Apply the best threshold to compute Dev metrics
+        # Apply that fixed threshold to Dev and Test, no further searching
+        if dev_probs is not None:
             dev_preds = (dev_probs > best_thresh).float()
             dev_acc = (dev_preds == dev_labels).float().mean().item()
             dev_auc = metrics.roc_auc_score(dev_labels, dev_probs) if len(torch.unique(dev_labels)) == 2 else 0.5
 
-            # Apply the SAME best threshold to compute Test metrics
-            if test_probs is not None:
-                test_preds = (test_probs > best_thresh).float()
-                test_acc = (test_preds == test_labels).float().mean().item()
-                test_auc = metrics.roc_auc_score(test_labels, test_probs) if len(torch.unique(test_labels)) == 2 else 0.5
+        if test_probs is not None:
+            test_preds = (test_probs > best_thresh).float()
+            test_acc = (test_preds == test_labels).float().mean().item()
+            test_auc = metrics.roc_auc_score(test_labels, test_probs) if len(torch.unique(test_labels)) == 2 else 0.5
 
-            with open("logs/per_epoch_loss.txt", "a") as f:
-                f.write(f"Epoch {epoch+1}/{params['num_epochs']}, Train Loss: {train_loss:.4f}, "
-                        f"Dev Acc: {dev_acc:.4f}, Dev AUC: {dev_auc:.4f}, "
-                        f"Test Acc: {test_acc:.4f}, Test AUC: {test_auc:.4f}, "
-                        f"Best Thresh: {best_thresh:.2f}\n")
-            print(f"[epoch {epoch+1}] train_loss={train_loss:.4f}, "
-                  f"dev_auc={dev_auc:.4f}, best_thresh={best_thresh:.2f}")
+        with open("logs/per_epoch_loss.txt", "a") as f:
+            f.write(f"Epoch {epoch+1}/{params['num_epochs']}, Train Loss: {train_loss:.4f}, "
+                    f"Dev Acc: {dev_acc:.4f}, Dev AUC: {dev_auc:.4f}, "
+                    f"Test Acc: {test_acc:.4f}, Test AUC: {test_auc:.4f}, "
+                    f"Best Thresh: {best_thresh:.2f}\n")
+        print(f"[epoch {epoch+1}] train_loss={train_loss:.4f}, "
+              f"dev_auc={dev_auc:.4f}, best_thresh={best_thresh:.2f}")
 
     return dev_acc, dev_auc, test_acc, test_auc
 
