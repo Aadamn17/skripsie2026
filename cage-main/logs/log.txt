@@ -1,0 +1,11 @@
+Architecture, dataset, bins, test_set, dev_set, learning_rate, weight_decay, batch_size, ACC, dev_acc, test_acc, AUC, dev_auc, test_auc
+Architecture, dataset, bins, test_set, dev_set, learning_rate, weight_decay, batch_size, ACC, dev_acc, test_acc, AUC, dev_auc, test_auc
+Architecture, dataset, bins, test_set, dev_set, learning_rate, weight_decay, batch_size, ACC, dev_acc, test_acc, AUC, dev_auc, test_auc
+Architecture, dataset, bins, test_set, dev_set, learning_rate, weight_decay, batch_size, ACC, dev_acc, test_acc, AUC, dev_auc, test_auc
+fusion,dataset,test_set,dev_set,lr,wd,batch_size,dev_acc,dev_auc,test_acc,test_auc
+intermediate_feature,cage,1,0,0.0001,0.0001,1,0.4884,0.6746,0.4651,0.5079
+fusion,dataset,test_set,dev_set,lr,wd,batch_size,dev_acc,dev_auc,test_acc,test_auc
+fusion,dataset,test_set,dev_set,lr,wd,batch_size,dev_acc,dev_auc,test_acc,test_auc
+intermediate_feature,cage,1,0,1e-05,1e-05,1,0.3953,0.4802,0.3023,0.4563
+fusion,dataset,test_set,dev_set,lr,wd,batch_size,dev_acc,dev_auc,test_acc,test_auc
+early_image,cage,1,0,1e-05,1e-05,1,0.2093,0.4008,0.1628,0.4325
