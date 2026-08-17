@@ -62,7 +62,12 @@ class CoughDataset(Dataset):
     def __init__(self, dataset, annotations_file, cough_dir, bins=128):
         self.dir = cough_dir
         self.dataset = dataset
-        self.labels = _filter_existing_files(pd.read_csv(annotations_file), self.dir)
+        print(f"[DEBUG] Loading CoughDataset CSV: {annotations_file}")
+        raw_df = pd.read_csv(annotations_file)
+        print(f"[DEBUG]   - Rows before filtering: {len(raw_df)}")
+        self.labels = _filter_existing_files(raw_df, self.dir)
+        print(f"[DEBUG]   - Rows after filtering: {len(self.labels)}")
+        print(f"[DEBUG]   - Cough IDs: {self.labels['Cough_ID'].tolist()}")
 
     def __len__(self):
         return len(self.labels)
@@ -82,7 +87,12 @@ class SpeechDataset(Dataset):
     def __init__(self, dataset, annotations_file, speech_dir, bins=128):
         self.dir = speech_dir
         self.dataset = dataset
-        self.labels = _filter_existing_files(pd.read_csv(annotations_file), self.dir)
+        #print(f"[DEBUG] Loading SpeechDataset CSV: {annotations_file}")
+        raw_df = pd.read_csv(annotations_file)
+        #print(f"[DEBUG]   - Rows before filtering: {len(raw_df)}")
+        self.labels = _filter_existing_files(raw_df, self.dir)
+        #print(f"[DEBUG]   - Rows after filtering: {len(self.labels)}")
+        #print(f"[DEBUG]   - Cough IDs: {self.labels['Cough_ID'].tolist()}")
 
     def __len__(self):
         return len(self.labels)
@@ -105,7 +115,12 @@ class CoughDatasetCleaned(Dataset):
     def __init__(self, dataset, annotations_file, cough_dir, loss, mean, std):
         self.dataset = dataset
         self.dir = cough_dir
-        self.labels = _filter_existing_files(pd.read_csv(annotations_file), self.dir)
+        print(f"[DEBUG] Loading CoughDatasetCleaned CSV: {annotations_file}")
+        raw_df = pd.read_csv(annotations_file)
+        print(f"[DEBUG]   - Rows before filtering: {len(raw_df)}")
+        self.labels = _filter_existing_files(raw_df, self.dir)
+        print(f"[DEBUG]   - Rows after filtering: {len(self.labels)}")
+        print(f"[DEBUG]   - Cough IDs: {self.labels['Cough_ID'].tolist()}")
         self.loss = loss
         self.mean = mean
         self.std = std
@@ -139,7 +154,12 @@ class SpeechDatasetCleaned(Dataset):
     def __init__(self, dataset, annotations_file, speech_dir, loss, mean, std):
         self.dataset = dataset
         self.dir = speech_dir
-        self.labels = _filter_existing_files(pd.read_csv(annotations_file), self.dir)
+        #print(f"[DEBUG] Loading SpeechDatasetCleaned CSV: {annotations_file}")
+        raw_df = pd.read_csv(annotations_file)
+        #print(f"[DEBUG]   - Rows before filtering: {len(raw_df)}")
+        self.labels = _filter_existing_files(raw_df, self.dir)
+        #print(f"[DEBUG]   - Rows after filtering: {len(self.labels)}")
+        #print(f"[DEBUG]   - Cough IDs: {self.labels['Cough_ID'].tolist()}")
         self.loss = loss
         self.mean = mean
         self.std = std
@@ -180,15 +200,23 @@ class PatientIntermediateDataset(Dataset):
     """
     def __init__(self, annotations_file, cough_dir, speech_dir,
                  cough_mean, cough_std, speech_mean, speech_std):
+        #print(f"[DEBUG] Loading PatientIntermediateDataset CSV: {annotations_file}")
         self.df = pd.read_csv(annotations_file)
+        #print(f"[DEBUG]   - Total rows loaded: {len(self.df)}")
         self.df['patient_id'] = self.df['Cough_ID'].astype(str).apply(lambda x: x.split('/')[0])
         self.df = self.df[self.df['Cough_ID'].astype(str).map(
             lambda cid: os.path.exists(os.path.join(cough_dir, cid + ".npy"))
         )].reset_index(drop=True)
+        #print(f"[DEBUG]   - Rows after filtering (existing coughs): {len(self.df)}")
         self.patients = self.df.groupby('patient_id').agg({
             'Cough_ID': list,
             'Status': 'first'
         }).reset_index()
+        #print(f"[DEBUG]   - Unique patients: {len(self.patients)}")
+        #print(f"[DEBUG]   - Patient details:")
+        for idx, row in self.patients.iterrows():
+            cough_ids = row['Cough_ID']
+            print(f"[DEBUG]     Patient {row['patient_id']}: {len(cough_ids)} coughs - {cough_ids}")
         self.cough_dir = cough_dir
         self.speech_dir = speech_dir
         self.cough_mean = cough_mean
@@ -213,23 +241,31 @@ class PatientIntermediateDataset(Dataset):
         label = row['Status']
 
         cough_images = []
+        cough_ids_loaded = []
         for cid in row['Cough_ID']:
             path = os.path.join(self.cough_dir, str(cid) + ".npy")
             if not os.path.exists(path):
                 continue
+            cough_ids_loaded.append(str(cid))
             raw = torch.tensor(np.transpose(np.load(path)))
             norm = (raw - self.cough_mean) / self.cough_std
             cough_images.append(self._to_image(norm))
 
         speech_images = []
+        speech_files_loaded = []
         speech_folder = os.path.join(self.speech_dir, patient_id)
         if os.path.isdir(speech_folder):
             for fname in os.listdir(speech_folder):
                 if fname.endswith('.npy'):
+                    speech_files_loaded.append(fname.replace('.npy', ''))
                     path = os.path.join(speech_folder, fname)
                     raw = torch.tensor(np.transpose(np.load(path)))
                     norm = (raw - self.speech_mean) / self.speech_std
                     speech_images.append(self._to_image(norm))
+
+        print(f"[DEBUG] PatientIntermediateDataset[{idx}] - Patient: {patient_id}, Label: {label}")
+        print(f"[DEBUG]   - Coughs loaded ({len(cough_ids_loaded)}): {cough_ids_loaded}")
+        print(f"[DEBUG]   - Speeches loaded ({len(speech_files_loaded)}): {speech_files_loaded}")
 
         return cough_images, speech_images, label
 
@@ -245,15 +281,23 @@ class PatientEarlyImageDataset(Dataset):
     """
     def __init__(self, annotations_file, cough_dir, speech_dir,
                  cough_mean, cough_std, speech_mean, speech_std):
+        print(f"[DEBUG] Loading PatientEarlyImageDataset CSV: {annotations_file}")
         self.df = pd.read_csv(annotations_file)
+        print(f"[DEBUG]   - Total rows loaded: {len(self.df)}")
         self.df['patient_id'] = self.df['Cough_ID'].astype(str).apply(lambda x: x.split('/')[0])
         self.df = self.df[self.df['Cough_ID'].astype(str).map(
             lambda cid: os.path.exists(os.path.join(cough_dir, cid + ".npy"))
         )].reset_index(drop=True)
+        print(f"[DEBUG]   - Rows after filtering (existing coughs): {len(self.df)}")
         self.patients = self.df.groupby('patient_id').agg({
             'Cough_ID': list,
             'Status': 'first'
         }).reset_index()
+        print(f"[DEBUG]   - Unique patients: {len(self.patients)}")
+        print(f"[DEBUG]   - Patient details:")
+        for idx, row in self.patients.iterrows():
+            cough_ids = row['Cough_ID']
+            print(f"[DEBUG]     Patient {row['patient_id']}: {len(cough_ids)} coughs - {cough_ids}")
         self.cough_dir = cough_dir
         self.speech_dir = speech_dir
         self.cough_mean = cough_mean
@@ -290,9 +334,11 @@ class PatientEarlyImageDataset(Dataset):
         # Pair them
         n_pairs = min(len(cough_ids), len(speech_files))
         fused_images = []
+        pairs_list = []
         for i in range(n_pairs):
             cid = cough_ids[i]
             sid = speech_files[i]
+            pairs_list.append((str(cid), str(sid)))
 
             c_path = os.path.join(self.cough_dir, cid + ".npy")
             c_raw = torch.tensor(np.transpose(np.load(c_path)))
@@ -306,6 +352,13 @@ class PatientEarlyImageDataset(Dataset):
 
             stacked = torch.stack([c_img, s_img, (c_img + s_img) / 2], dim=0)  # (3,224,224)
             fused_images.append(stacked)
+
+        print(f"[DEBUG] PatientEarlyImageDataset[{idx}] - Patient: {patient_id}, Label: {label}")
+        print(f"[DEBUG]   - Available coughs ({len(cough_ids)}): {[str(c) for c in cough_ids]}")
+        print(f"[DEBUG]   - Available speeches ({len(speech_files)}): {speech_files}")
+        print(f"[DEBUG]   - Fused pairs ({len(pairs_list)}):")
+        for cid, sid in pairs_list:
+            print(f"[DEBUG]     → Cough {cid} + Speech {sid}")
 
         return fused_images, label
 

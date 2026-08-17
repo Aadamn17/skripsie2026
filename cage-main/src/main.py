@@ -12,7 +12,7 @@ grid = {
     'test_set': [1], 
     'dev_set': [0],
     'num_epochs': [10],
-    'batch_size': [1],        # Batch size 1 for patient-level lists
+    'batch_size': [32],        # Batch size 1 for patient-level lists
     'learning_rate': [1e-4],
     'weight_decay': [1e-4],
     'dataset': ["cage"],

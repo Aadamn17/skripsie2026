@@ -74,13 +74,18 @@ class PatientIntermediateClassifier(nn.Module):
                     param.requires_grad = True
 
         self.classifier = nn.Sequential(
-            nn.Linear(512 * 2, 16),   # reduced complexity
-            nn.ReLU(),
+            nn.Linear(512 * 2, 16),   # layer 1
+            nn.ReLU(),       
             nn.Dropout(0.4),
-            nn.Linear(16, num_classes)
+            nn.Linear(16, num_classes) #layer 4
         )
 
     def forward(self, cough_images, speech_images):
+        '''Forward pass for intermediate fuison
+        cough_images: Tensor or list of Tensors [N, C, H, W] or [C, H, W]
+        speech_images: Tensor or list of Tensors [N, C, H, W]
+        -> This function computes the average feature representation for each modality
+        and concatenates them before passing through the classifier.'''
         device = next(self.parameters()).device
         c_batch = _prepare_image_batch(cough_images, device)
         s_batch = _prepare_image_batch(speech_images, device)
@@ -249,4 +254,4 @@ def train_epoch(train_data, model, optimizer, criterion):
         optimizer.step()
         total_loss += loss.item()
         num_samples += labels.size(0)
-    return total_loss / num_samples
+    return total_loss / num_samples #->average loss per sample
