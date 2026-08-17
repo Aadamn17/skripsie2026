@@ -113,8 +113,10 @@ class PatientEarlyImageClassifier(nn.Module):
 
         if not freeze_backbone:
             for name, param in resnet.named_parameters():
-                if 'layer4' in name:
-                    param.requires_grad = True
+                param.requires_grad = 'layer4' in name   # freeze everything except layer4
+        else:
+            for param in resnet.parameters():
+                param.requires_grad = False
 
         self.classifier = nn.Sequential(
             nn.Linear(512, 16),
@@ -171,7 +173,14 @@ def train_validate(train_data, dev_data, test_data, model, params):
         optimizer, mode='min', factor=0.5, patience=3
     )
     criterion = torch.nn.CrossEntropyLoss()
-
+    all_train_labels = []
+    for batch in train_data:
+        all_train_labels.append(batch[-1].item())
+    all_train_labels = torch.tensor(all_train_labels)
+    class_counts = torch.bincount(all_train_labels.long(), minlength=2)
+    class_weights = (1.0 / class_counts.float())
+    class_weights = (class_weights / class_weights.sum() * len(class_counts)).to(device)
+    criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
     dev_acc, dev_auc, test_acc, test_auc = 0.0, 0.0, 0.0, 0.0
 
     for epoch in range(params["num_epochs"]):
