@@ -35,11 +35,11 @@ def _prepare_image_batch(images, device):
     if not batches:
         return torch.empty((0, 3, 224, 224), device=device)
 
-    return torch.cat(batches, dim=0)
+    return torch.cat(batches, dim=0) #->stacks each batch ontop of eachother
 
 
 # ------------------------------------------------------------------
-# 1. Single-Modality Classifiers
+# 1. Single-Modality Classifiers and Encoders (Cough or Speech)
 # ------------------------------------------------------------------
 class Logistic_Regression(nn.Module):
     def __init__(self, input_dim=128, num_classes=2):
@@ -55,7 +55,39 @@ class ResNet18(nn.Module):
         self.resnet.fc = nn.Linear(512, num_classes)
     def forward(self, x):
         return self.resnet(x)
+class LSTMVAE(nn.Module):
+    def __init__(self, input_dim=128, hidden_dim=64, latent_dim=32, num_layers=1, num_classes=2):
+        super().__init__()
+        self.encoder = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
+        self.fc_mu = nn.Linear(hidden_dim, latent_dim)
+        self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
+        self.decoder = nn.LSTM(latent_dim, hidden_dim, num_layers, batch_first=True)
+        self.fc_out = nn.Linear(hidden_dim, input_dim)
+        self.classifier = nn.Linear(latent_dim, num_classes)
 
+    def encode(self, x):
+        _, (h_n, _) = self.encoder(x)
+        h_n = h_n[-1]
+        mu = self.fc_mu(h_n)
+        logvar = self.fc_logvar(h_n)
+        return mu, logvar
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def decode(self, z):
+        z = z.unsqueeze(1).repeat(1, 10, 1)  # Repeat for sequence length
+        out, _ = self.decoder(z)
+        return self.fc_out(out)
+
+    def forward(self, x):
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        recon_x = self.decode(z)
+        class_logits = self.classifier(z)
+        return recon_x, class_logits
 
 # ------------------------------------------------------------------
 # 2. INTERMEDIATE FUSION (Separate ResNets + avg + concat + MLP)
@@ -64,48 +96,57 @@ class PatientIntermediateClassifier(nn.Module):
     def __init__(self, num_classes=2, freeze_backbone=False):
         super().__init__()
         resnet = resnet18(pretrained=True)
-        self.backbone = nn.Sequential(*list(resnet.children())[:-2])
+        self.backbone = nn.Sequential(*list(resnet.children())[:-1])  #-> remove the last two layers (avgpool and fc), allows to use resnet18 as an encoder.
         self.pool = nn.AdaptiveAvgPool2d(1)
 
-        # 🔧 Selective fine‑tuning: only train layer4 + classifier
+        #Selective fine‑tuning: only train layer4 + classifier
         if not freeze_backbone:
             for name, param in resnet.named_parameters():
                 if 'layer4' in name:   # Unfreeze only the last residual block
                     param.requires_grad = True
-
+        #MLP CLASSIFIER
         self.classifier = nn.Sequential(
-            nn.Linear(512 * 2, 16),   # layer 1
+            nn.Linear(1024, 16),   # layer 1
             nn.ReLU(),       
             nn.Dropout(0.4),
             nn.Linear(16, num_classes) #layer 4
         )
 
     def forward(self, cough_images, speech_images):
-        '''Forward pass for intermediate fuison
-        cough_images: Tensor or list of Tensors [N, C, H, W] or [C, H, W]
-        speech_images: Tensor or list of Tensors [N, C, H, W]
-        -> This function computes the average feature representation for each modality
-        and concatenates them before passing through the classifier.'''
         device = next(self.parameters()).device
-        c_batch = _prepare_image_batch(cough_images, device)
-        s_batch = _prepare_image_batch(speech_images, device)
 
-        if c_batch.numel() > 0:
-            c_feats = self.pool(self.backbone(c_batch)).flatten(1)
-            c_avg = c_feats.mean(dim=0, keepdim=True)
+        # --- Cough: encode each spectrogram separately, then join ---
+        c_feats_list = []
+        for img in (cough_images or []):
+            img = img.to(device=device, dtype=torch.float32)
+            if img.dim() == 3:
+                img = img.unsqueeze(0)          # [1, 3, 224, 224]
+            feat = self.pool(self.backbone(img)).flatten(1)   # [1, 512]
+            c_feats_list.append(feat)
+
+        if c_feats_list:
+            c_feats = torch.cat(c_feats_list, dim=0)   # [N, 512] -- "joined" outputs
+            c_avg = c_feats.max(dim=0, keepdim=True).values  # [1, 512]
         else:
             c_avg = torch.zeros(1, 512, device=device)
 
-        if s_batch.numel() > 0:
-            s_feats = self.pool(self.backbone(s_batch)).flatten(1)
-            s_avg = s_feats.mean(dim=0, keepdim=True)
+        # --- Speech: same pattern ---
+        s_feats_list = []
+        for img in (speech_images or []):
+            img = img.to(device=device, dtype=torch.float32)
+            if img.dim() == 3:
+                img = img.unsqueeze(0)
+            feat = self.pool(self.backbone(img)).flatten(1)
+            s_feats_list.append(feat)
+
+        if s_feats_list:
+            s_feats = torch.cat(s_feats_list, dim=0)
+            s_avg = s_feats.max(dim=0, keepdim=True).values
         else:
             s_avg = torch.zeros(1, 512, device=device)
 
-        fused = torch.cat([c_avg, s_avg], dim=1)
+        fused = torch.cat([c_avg, s_avg], dim=1)  # [1, 1024]
         return self.classifier(fused)
-
-
 # ------------------------------------------------------------------
 # 3. TRUE EARLY FUSION (One ResNet on stacked images)
 # ------------------------------------------------------------------
@@ -113,7 +154,7 @@ class PatientEarlyImageClassifier(nn.Module):
     def __init__(self, num_classes=2, freeze_backbone=False):
         super().__init__()
         resnet = resnet18(pretrained=True)
-        self.backbone = nn.Sequential(*list(resnet.children())[:-2])
+        self.backbone = nn.Sequential(*list(resnet.children())[:-2])  #-> remove the last two layers (avgpool and fc), allows to use resnet18 as an encoder.
         self.pool = nn.AdaptiveAvgPool2d(1)
 
         if not freeze_backbone:
@@ -122,7 +163,7 @@ class PatientEarlyImageClassifier(nn.Module):
         else:
             for param in resnet.parameters():
                 param.requires_grad = False
-
+        #MLP CLASSIFIER
         self.classifier = nn.Sequential(
             nn.Linear(512, 16),
             nn.ReLU(),
