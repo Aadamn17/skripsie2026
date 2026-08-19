@@ -11,14 +11,14 @@ grid = {
     'loss_selected': ["cross_entropy_resnet"],
     'test_set': [1], 
     'dev_set': [0],
-    'num_epochs': [20],
-    'batch_size': [8],        # Batch size 1 for patient-level lists
+    'num_epochs': [32],
+    'batch_size': [32],        
     'learning_rate': [1e-4],
     'weight_decay': [1e-4],
     'dataset': ["cage"],
-    'arch': ["resnet"],
+    'arch': ["resnet18"], #lr,resnet18
     # 'fusion': ["intermediate_feature", "early_image", "none"]  # Uncomment to run all
-    'fusion': ["intermediate_feature"]  # Change this to "intermediate_feature" to run your method
+    'fusion': ["none"]  # Change this to "intermediate_feature" to run your method
 }
 
 log_file = "logs/log.txt"
@@ -52,7 +52,10 @@ def main(grid):
                 cough_dir=cough_dir, loss=point['loss_selected'],
                 batch_size=point['batch_size'], num_outer_folds=10
             )
-            model = ResNet18(num_classes=2).to(device)
+            if point['arch'] == "lr":
+                model = Logistic_Regression(num_classes=2).to(device)
+            elif point['arch'] == "resnet18":
+                model = ResNet18(num_classes=2).to(device)
 
         elif point['fusion'] == "intermediate_feature":
             train, val, test = get_intermediate_data(

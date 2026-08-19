@@ -370,6 +370,26 @@ class PatientEarlyImageDataset(Dataset):
 # ======================================================================
 # 7. Loader functions
 # ======================================================================
+def _patient_intermediate_collate(batch):
+    cough_batch = []
+    speech_batch = []
+    labels = []
+    for cough_images, speech_images, label in batch:
+        cough_batch.append(cough_images)
+        speech_batch.append(speech_images)
+        labels.append(label)
+    return cough_batch, speech_batch, torch.tensor(labels, dtype=torch.long)
+
+
+def _patient_early_collate(batch):
+    fused_batch = []
+    labels = []
+    for fused_images, label in batch:
+        fused_batch.append(fused_images)
+        labels.append(label)
+    return fused_batch, torch.tensor(labels, dtype=torch.long)
+
+
 def get_cough_data(dataset, data_folds, i, j, cough_dir, loss, batch_size, num_outer_folds=10):
     train_set_files = []
     for k in range(num_outer_folds):
@@ -405,9 +425,30 @@ def get_intermediate_data(dataset, data_folds, i, j, cough_dir, speech_dir, loss
     test_set_file = data_folds + "/fold_" + str(i)
     c_mean, c_std = get_mean_std_cough(train_set_files, dataset, cough_dir, 128)
     s_mean, s_std = get_mean_std_speech(train_set_files, dataset, speech_dir, 128)
-    train_data = DataLoader(ConcatDataset([PatientIntermediateDataset(f+".csv", cough_dir, speech_dir, c_mean, c_std, s_mean, s_std) for f in train_set_files]), batch_size=batch_size, num_workers=4, shuffle=True, drop_last=True)
-    val_data = DataLoader(PatientIntermediateDataset(dev_set_file+".csv", cough_dir, speech_dir, c_mean, c_std, s_mean, s_std), batch_size=batch_size, num_workers=4, shuffle=False, drop_last=True) if j is not None else None
-    test_data = DataLoader(PatientIntermediateDataset(test_set_file+".csv", cough_dir, speech_dir, c_mean, c_std, s_mean, s_std), batch_size=batch_size, num_workers=4, shuffle=False, drop_last=True) if i is not None else None
+    train_data = DataLoader(
+        ConcatDataset([PatientIntermediateDataset(f+".csv", cough_dir, speech_dir, c_mean, c_std, s_mean, s_std) for f in train_set_files]),
+        batch_size=batch_size,
+        num_workers=4,
+        shuffle=True,
+        drop_last=True,
+        collate_fn=_patient_intermediate_collate,
+    )
+    val_data = DataLoader(
+        PatientIntermediateDataset(dev_set_file+".csv", cough_dir, speech_dir, c_mean, c_std, s_mean, s_std),
+        batch_size=batch_size,
+        num_workers=4,
+        shuffle=False,
+        drop_last=True,
+        collate_fn=_patient_intermediate_collate,
+    ) if j is not None else None
+    test_data = DataLoader(
+        PatientIntermediateDataset(test_set_file+".csv", cough_dir, speech_dir, c_mean, c_std, s_mean, s_std),
+        batch_size=batch_size,
+        num_workers=4,
+        shuffle=False,
+        drop_last=True,
+        collate_fn=_patient_intermediate_collate,
+    ) if i is not None else None
     return train_data, val_data, test_data
 
 def get_early_image_data(dataset, data_folds, i, j, cough_dir, speech_dir, loss, batch_size=1, num_outer_folds=10):
@@ -419,7 +460,28 @@ def get_early_image_data(dataset, data_folds, i, j, cough_dir, speech_dir, loss,
     test_set_file = data_folds + "/fold_" + str(i)
     c_mean, c_std = get_mean_std_cough(train_set_files, dataset, cough_dir, 128)
     s_mean, s_std = get_mean_std_speech(train_set_files, dataset, speech_dir, 128)
-    train_data = DataLoader(ConcatDataset([PatientEarlyImageDataset(f+".csv", cough_dir, speech_dir, c_mean, c_std, s_mean, s_std) for f in train_set_files]), batch_size=batch_size, num_workers=4, shuffle=True, drop_last=True)
-    val_data = DataLoader(PatientEarlyImageDataset(dev_set_file+".csv", cough_dir, speech_dir, c_mean, c_std, s_mean, s_std), batch_size=batch_size, num_workers=4, shuffle=False, drop_last=True) if j is not None else None
-    test_data = DataLoader(PatientEarlyImageDataset(test_set_file+".csv", cough_dir, speech_dir, c_mean, c_std, s_mean, s_std), batch_size=batch_size, num_workers=4, shuffle=False, drop_last=True) if i is not None else None
+    train_data = DataLoader(
+        ConcatDataset([PatientEarlyImageDataset(f+".csv", cough_dir, speech_dir, c_mean, c_std, s_mean, s_std) for f in train_set_files]),
+        batch_size=batch_size,
+        num_workers=4,
+        shuffle=True,
+        drop_last=True,
+        collate_fn=_patient_early_collate,
+    )
+    val_data = DataLoader(
+        PatientEarlyImageDataset(dev_set_file+".csv", cough_dir, speech_dir, c_mean, c_std, s_mean, s_std),
+        batch_size=batch_size,
+        num_workers=4,
+        shuffle=False,
+        drop_last=True,
+        collate_fn=_patient_early_collate,
+    ) if j is not None else None
+    test_data = DataLoader(
+        PatientEarlyImageDataset(test_set_file+".csv", cough_dir, speech_dir, c_mean, c_std, s_mean, s_std),
+        batch_size=batch_size,
+        num_workers=4,
+        shuffle=False,
+        drop_last=True,
+        collate_fn=_patient_early_collate,
+    ) if i is not None else None
     return train_data, val_data, test_data

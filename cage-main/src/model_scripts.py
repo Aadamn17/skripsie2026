@@ -51,7 +51,7 @@ class Logistic_Regression(nn.Module):
 class ResNet18(nn.Module):
     def __init__(self, num_classes=2):
         super().__init__()
-        self.resnet = resnet18()
+        self.resnet = resnet18(weights='IMAGENET1K_V1')
         self.resnet.fc = nn.Linear(512, num_classes)
     def forward(self, x):
         return self.resnet(x)
@@ -95,7 +95,7 @@ class LSTMVAE(nn.Module):
 class PatientIntermediateClassifier(nn.Module):
     def __init__(self, num_classes=2, freeze_backbone=False):
         super().__init__()
-        resnet = resnet18(pretrained=True)
+        resnet = resnet18(weights='IMAGENET1K_V1')
         self.backbone = nn.Sequential(*list(resnet.children())[:-2])  #-> remove the last two layers (avgpool and fc), allows to use resnet18 as an encoder.
         self.pool = nn.AdaptiveAvgPool2d(1)
 
@@ -112,7 +112,7 @@ class PatientIntermediateClassifier(nn.Module):
             nn.Linear(16, num_classes) #output layer
         )
 
-    def forward(self, cough_images, speech_images):
+    def _forward_single(self, cough_images, speech_images):
         device = next(self.parameters()).device
 
         # --- Cough: encode each spectrogram separately, then join ---
@@ -147,13 +147,21 @@ class PatientIntermediateClassifier(nn.Module):
 
         fused = torch.cat([c_avg, s_avg], dim=1)  # [1, 1024]
         return self.classifier(fused)
+
+    def forward(self, cough_images, speech_images):
+        if isinstance(cough_images, (list, tuple)) and len(cough_images) > 0 and isinstance(cough_images[0], (list, tuple)):
+            logits = []
+            for c_imgs, s_imgs in zip(cough_images, speech_images):
+                logits.append(self._forward_single(c_imgs, s_imgs))
+            return torch.cat(logits, dim=0)
+        return self._forward_single(cough_images, speech_images)
 # ------------------------------------------------------------------
 # 3. TRUE EARLY FUSION (One ResNet on stacked images)
 # ------------------------------------------------------------------
 class PatientEarlyImageClassifier(nn.Module):
     def __init__(self, num_classes=2, freeze_backbone=False):
         super().__init__()
-        resnet = resnet18(pretrained=True)
+        resnet = resnet18(weights='IMAGENET1K_V1')
         self.backbone = nn.Sequential(*list(resnet.children())[:-2])  #-> remove the last two layers (avgpool and fc), allows to use resnet18 as an encoder.
         self.pool = nn.AdaptiveAvgPool2d(1)
 
@@ -171,7 +179,7 @@ class PatientEarlyImageClassifier(nn.Module):
             nn.Linear(16, num_classes)
         )
 
-    def forward(self, fused_images):
+    def _forward_single(self, fused_images):
         device = next(self.parameters()).device
         batch = _prepare_image_batch(fused_images, device)
 
@@ -182,10 +190,31 @@ class PatientEarlyImageClassifier(nn.Module):
             avg_feat = torch.zeros(1, 512, device=device)
         return self.classifier(avg_feat)
 
+    def forward(self, fused_images):
+        if isinstance(fused_images, (list, tuple)) and len(fused_images) > 0 and isinstance(fused_images[0], (list, tuple)):
+            logits = []
+            for patient_images in fused_images:
+                logits.append(self._forward_single(patient_images))
+            return torch.cat(logits, dim=0)
+        return self._forward_single(fused_images)
+
 
 # ------------------------------------------------------------------
 # 4. Training and Evaluation Functions (with dynamic threshold)
 # ------------------------------------------------------------------
+def _flatten_labels(batch):
+    if isinstance(batch, (list, tuple)):
+        label_tensor = batch[-1]
+    else:
+        label_tensor = batch
+
+    if isinstance(label_tensor, torch.Tensor):
+        return label_tensor.detach().reshape(-1).cpu()
+    if isinstance(label_tensor, (list, tuple)):
+        return torch.tensor(label_tensor, dtype=torch.long).reshape(-1)
+    return torch.tensor([label_tensor], dtype=torch.long).reshape(-1)
+
+
 def get_probs_and_labels(loader, model, criterion):
     """Helper: Returns raw probabilities and labels without applying a threshold."""
     model.eval()
@@ -205,9 +234,10 @@ def get_probs_and_labels(loader, model, criterion):
                 labels = labels.to(device)
                 input_data = input_data.to(torch.float32).to(device)
                 output = model(input_data)
-            prob = torch.nn.functional.softmax(output, dim=1)[0, 1].item()
-            all_probs.append(prob)
-            all_labels.append(labels.item())
+
+            probs = torch.nn.functional.softmax(output, dim=1)[:, 1].detach().cpu()
+            all_probs.extend(probs.tolist())
+            all_labels.extend(labels.detach().cpu().reshape(-1).tolist())
     return torch.tensor(all_probs), torch.tensor(all_labels)
 
 
@@ -218,38 +248,34 @@ def train_validate(train_data, dev_data, test_data, model, params):
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=3
     )
+    criterion = torch.nn.CrossEntropyLoss()   # no class weights
 
-    # --- compute class weights from the training set ---
-    all_train_labels = []
-    for batch in train_data:
-        all_train_labels.append(batch[-1].item())
-    all_train_labels = torch.tensor(all_train_labels)
-    class_counts = torch.bincount(all_train_labels.long(), minlength=2)
-    class_weights = (1.0 / class_counts.float())
-    class_weights = (class_weights / class_weights.sum() * len(class_counts)).to(device)
-    criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
+    best_dev_auc = 0.0
+    best_model_state = None
+    patience_counter = 0
+    patience = 5
 
     dev_acc, dev_auc, test_acc, test_auc = 0.0, 0.0, 0.0, 0.0
 
     for epoch in range(params["num_epochs"]):
         train_loss = train_epoch(train_data, model, optimizer, criterion)
 
-        # Get raw probabilities and labels for Train, Dev and Test
-        train_probs, train_labels = get_probs_and_labels(train_data, model, criterion)
+        # Get predictions on dev and test
         dev_probs, dev_labels = get_probs_and_labels(dev_data, model, criterion) if dev_data else (None, None)
         test_probs, test_labels = get_probs_and_labels(test_data, model, criterion) if test_data else (None, None)
 
-        # --- THRESHOLD SELECTION ON TRAIN, NOT DEV ---
+        # --- Select threshold on DEV set (not train) ---
         best_thresh = 0.5
         best_f1 = 0.0
-        for thresh in np.arange(0.1, 0.9, 0.02):
-            preds = (train_probs > thresh).float()
-            f1 = metrics.f1_score(train_labels, preds, zero_division=0)
-            if f1 > best_f1:
-                best_f1 = f1
-                best_thresh = thresh
+        if dev_probs is not None and len(torch.unique(dev_labels)) == 2:
+            for thresh in np.arange(0.1, 0.9, 0.02):
+                preds = (dev_probs > thresh).float()
+                f1 = metrics.f1_score(dev_labels, preds, zero_division=0)
+                if f1 > best_f1:
+                    best_f1 = f1
+                    best_thresh = thresh
 
-        # Apply that fixed threshold to Dev and Test, no further searching
+        # Apply threshold to dev and test
         if dev_probs is not None:
             dev_preds = (dev_probs > best_thresh).float()
             dev_acc = (dev_preds == dev_labels).float().mean().item()
@@ -260,6 +286,20 @@ def train_validate(train_data, dev_data, test_data, model, params):
             test_acc = (test_preds == test_labels).float().mean().item()
             test_auc = metrics.roc_auc_score(test_labels, test_probs) if len(torch.unique(test_labels)) == 2 else 0.5
 
+        # --- Early stopping based on dev AUC ---
+        '''if dev_auc > best_dev_auc:
+            best_dev_auc = dev_auc
+            best_model_state = model.state_dict()
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"Early stopping at epoch {epoch+1}")
+                break'''
+
+        # Use train_loss for the scheduler (dev_loss not computed)
+        scheduler.step(train_loss)
+
         with open("logs/per_epoch_loss.txt", "a") as f:
             f.write(f"Epoch {epoch+1}/{params['num_epochs']}, Train Loss: {train_loss:.4f}, "
                     f"Dev Acc: {dev_acc:.4f}, Dev AUC: {dev_auc:.4f}, "
@@ -267,6 +307,10 @@ def train_validate(train_data, dev_data, test_data, model, params):
                     f"Best Thresh: {best_thresh:.2f}\n")
         print(f"[epoch {epoch+1}] train_loss={train_loss:.4f}, "
               f"dev_auc={dev_auc:.4f}, best_thresh={best_thresh:.2f}")
+
+    # Restore best model
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
 
     return dev_acc, dev_auc, test_acc, test_auc
 
