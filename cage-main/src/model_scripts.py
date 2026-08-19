@@ -96,7 +96,7 @@ class PatientIntermediateClassifier(nn.Module):
     def __init__(self, num_classes=2, freeze_backbone=False):
         super().__init__()
         resnet = resnet18(pretrained=True)
-        self.backbone = nn.Sequential(*list(resnet.children())[:-1])  #-> remove the last two layers (avgpool and fc), allows to use resnet18 as an encoder.
+        self.backbone = nn.Sequential(*list(resnet.children())[:-2])  #-> remove the last two layers (avgpool and fc), allows to use resnet18 as an encoder.
         self.pool = nn.AdaptiveAvgPool2d(1)
 
         #Selective fine‑tuning: only train layer4 + classifier
@@ -106,10 +106,10 @@ class PatientIntermediateClassifier(nn.Module):
                     param.requires_grad = True
         #MLP CLASSIFIER
         self.classifier = nn.Sequential(
-            nn.Linear(1024, 16),   # layer 1
+            nn.Linear(1024, 16),   # layer 1 -> 1024 input features (512 from cough + 512 from speech)
             nn.ReLU(),       
             nn.Dropout(0.4),
-            nn.Linear(16, num_classes) #layer 4
+            nn.Linear(16, num_classes) #output layer
         )
 
     def forward(self, cough_images, speech_images):
@@ -120,7 +120,7 @@ class PatientIntermediateClassifier(nn.Module):
         for img in (cough_images or []):
             img = img.to(device=device, dtype=torch.float32)
             if img.dim() == 3:
-                img = img.unsqueeze(0)          # [1, 3, 224, 224]
+                img = img.unsqueeze(0)          # [1, 3, 224, 224] ->resnet expects a batch dimension
             feat = self.pool(self.backbone(img)).flatten(1)   # [1, 512]
             c_feats_list.append(feat)
 
