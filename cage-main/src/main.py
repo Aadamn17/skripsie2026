@@ -9,16 +9,16 @@ from model_scripts import *
 # ------------------------------------------------------------------
 grid = {
     'loss_selected': ["cross_entropy_resnet"],
-    'test_set': [1], 
-    'dev_set': [0],
+    'test_set': [0,1,2,3,4,5,6,7,8,9],
+    'dev_set': [0,1,2,3,4,5,6,7,8,9], 
     'num_epochs': [32],
     'batch_size': [32],        
-    'learning_rate': [1e-4],
-    'weight_decay': [1e-4],
+    'learning_rate': [5e-5],
+    'weight_decay': [5e-5],
     'dataset': ["cage"],
     'arch': ["resnet18"], #lr,resnet18
     # 'fusion': ["intermediate_feature", "early_image", "none"]  # Uncomment to run all
-    'fusion': ["none"]  # Change this to "intermediate_feature" to run your method
+    'fusion': ["early_image"]  # Uncomment to run all
 }
 
 log_file = "logs/log.txt"
@@ -75,7 +75,7 @@ def main(grid):
                 loss=point['loss_selected'], batch_size=point['batch_size'],
                 num_outer_folds=10
             )
-            model = PatientEarlyImageClassifier(num_classes=2,freeze_backbone=False).to(device)
+            model = PatientEarlyImageClassifier(num_classes=2,freeze_backbone=True).to(device)
 
         else:
             raise ValueError(f"Unknown fusion method: {point['fusion']}")

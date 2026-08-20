@@ -51,7 +51,7 @@ class Logistic_Regression(nn.Module):
 class ResNet18(nn.Module):
     def __init__(self, num_classes=2):
         super().__init__()
-        self.resnet = resnet18(weights='IMAGENET1K_V1')
+        self.resnet = resnet18(weights=None)  # No pre-trained weights
         self.resnet.fc = nn.Linear(512, num_classes)
     def forward(self, x):
         return self.resnet(x)
@@ -159,7 +159,7 @@ class PatientIntermediateClassifier(nn.Module):
 # 3. TRUE EARLY FUSION (One ResNet on stacked images)
 # ------------------------------------------------------------------
 class PatientEarlyImageClassifier(nn.Module):
-    def __init__(self, num_classes=2, freeze_backbone=False):
+    def __init__(self, num_classes=2, freeze_backbone=True):
         super().__init__()
         resnet = resnet18(weights='IMAGENET1K_V1')
         self.backbone = nn.Sequential(*list(resnet.children())[:-2])  #-> remove the last two layers (avgpool and fc), allows to use resnet18 as an encoder.
@@ -173,10 +173,10 @@ class PatientEarlyImageClassifier(nn.Module):
                 param.requires_grad = False
         #MLP CLASSIFIER
         self.classifier = nn.Sequential(
-            nn.Linear(512, 16),
+            nn.Linear(512, 4),
             nn.ReLU(),
-            nn.Dropout(0.4),
-            nn.Linear(16, num_classes)
+            nn.Dropout(0.5),
+            nn.Linear(4, num_classes)
         )
 
     def _forward_single(self, fused_images):
@@ -287,7 +287,7 @@ def train_validate(train_data, dev_data, test_data, model, params):
             test_auc = metrics.roc_auc_score(test_labels, test_probs) if len(torch.unique(test_labels)) == 2 else 0.5
 
         # --- Early stopping based on dev AUC ---
-        '''if dev_auc > best_dev_auc:
+        if dev_auc > best_dev_auc:
             best_dev_auc = dev_auc
             best_model_state = model.state_dict()
             patience_counter = 0
@@ -295,7 +295,7 @@ def train_validate(train_data, dev_data, test_data, model, params):
             patience_counter += 1
             if patience_counter >= patience:
                 print(f"Early stopping at epoch {epoch+1}")
-                break'''
+                break
 
         # Use train_loss for the scheduler (dev_loss not computed)
         scheduler.step(train_loss)
