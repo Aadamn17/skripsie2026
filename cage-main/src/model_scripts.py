@@ -6,7 +6,9 @@ from torchvision.models import resnet18
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
+# ======================================================================
+# Helper to prepare image batches (list of tensors -> single tensor)
+# ======================================================================
 def _prepare_image_batch(images, device):
     if images is None:
         return torch.empty((0, 3, 224, 224), device=device, dtype=torch.float32)
@@ -35,12 +37,35 @@ def _prepare_image_batch(images, device):
     if not batches:
         return torch.empty((0, 3, 224, 224), device=device)
 
-    return torch.cat(batches, dim=0) #->stacks each batch ontop of eachother
+    return torch.cat(batches, dim=0)
 
 
-# ------------------------------------------------------------------
-# 1. Single-Modality Classifiers and Encoders (Cough or Speech)
-# ------------------------------------------------------------------
+# ======================================================================
+# Self‑Attention Pooling (single head)
+# Learnable query vector selects the most important features
+# ======================================================================
+class SelfAttentionPool(nn.Module):
+    def __init__(self, dim=512):
+        super().__init__()
+        # Trainable query vector – learns "what a good feature looks like"
+        self.query = nn.Parameter(torch.randn(dim))
+
+    def forward(self, features):
+        # features: (N, dim) – N = number of images (coughs/speeches/pairs)
+        # 1. Compute alignment scores (dot product with query)
+        scores = torch.matmul(features, self.query)   # (N,)
+        # 2. Scale to avoid softmax saturation
+        scores = scores / (self.query.size(0) ** 0.5)
+        # 3. Convert to weights (sum to 1)
+        weights = torch.softmax(scores, dim=0)        # (N,)
+        # 4. Weighted sum of features
+        pooled = torch.sum(features * weights.unsqueeze(1), dim=0)  # (dim,)
+        return pooled
+
+
+# ======================================================================
+# 1. Single‑Modality Classifiers (Cough‑only or Speech‑only)
+# ======================================================================
 class Logistic_Regression(nn.Module):
     def __init__(self, input_dim=128, num_classes=2):
         super().__init__()
@@ -48,105 +73,61 @@ class Logistic_Regression(nn.Module):
     def forward(self, x):
         return self.linear(x)
 
+
 class ResNet18(nn.Module):
     def __init__(self, num_classes=2):
         super().__init__()
-        self.resnet = resnet18(weights=None)  # No pre-trained weights
+        self.resnet = resnet18(weights=None)  # No pre‑trained weights
         self.resnet.fc = nn.Linear(512, num_classes)
     def forward(self, x):
         return self.resnet(x)
-class LSTMVAE(nn.Module):
-    def __init__(self, input_dim=128, hidden_dim=64, latent_dim=32, num_layers=1, num_classes=2):
-        super().__init__()
-        self.encoder = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
-        self.fc_mu = nn.Linear(hidden_dim, latent_dim)
-        self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
-        self.decoder = nn.LSTM(latent_dim, hidden_dim, num_layers, batch_first=True)
-        self.fc_out = nn.Linear(hidden_dim, input_dim)
-        self.classifier = nn.Linear(latent_dim, num_classes)
 
-    def encode(self, x):
-        _, (h_n, _) = self.encoder(x)
-        h_n = h_n[-1]
-        mu = self.fc_mu(h_n)
-        logvar = self.fc_logvar(h_n)
-        return mu, logvar
 
-    def reparameterize(self, mu, logvar):
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
-
-    def decode(self, z):
-        z = z.unsqueeze(1).repeat(1, 10, 1)  # Repeat for sequence length
-        out, _ = self.decoder(z)
-        return self.fc_out(out)
-
-    def forward(self, x):
-        mu, logvar = self.encode(x)
-        z = self.reparameterize(mu, logvar)
-        recon_x = self.decode(z)
-        class_logits = self.classifier(z)
-        return recon_x, class_logits
-
-# ------------------------------------------------------------------
-# 2. INTERMEDIATE FUSION (Separate ResNets + avg + concat + MLP)
-# ------------------------------------------------------------------
+# ======================================================================
+# 2. Intermediate Fusion (Separate ResNets + attention pooling)
+# ======================================================================
 class PatientIntermediateClassifier(nn.Module):
     def __init__(self, num_classes=2, freeze_backbone=False):
         super().__init__()
         resnet = resnet18(weights='IMAGENET1K_V1')
-        self.backbone = nn.Sequential(*list(resnet.children())[:-2])  #-> remove the last two layers (avgpool and fc), allows to use resnet18 as an encoder.
+        self.backbone = nn.Sequential(*list(resnet.children())[:-2])  # remove avgpool & fc
         self.pool = nn.AdaptiveAvgPool2d(1)
 
-        #Selective fine‑tuning: only train layer4 + classifier
+        # Separate attention pooling per modality
+        self.cough_attn = SelfAttentionPool(dim=512)
+        self.speech_attn = SelfAttentionPool(dim=512)
+
+        # Optional: unfreeze layer4 if freeze_backbone=False
         if not freeze_backbone:
             for name, param in resnet.named_parameters():
-                if 'layer4' in name:   # Unfreeze only the last residual block
+                if 'layer4' in name:
                     param.requires_grad = True
-        #MLP CLASSIFIER
-        self.classifier = nn.Sequential(
-            nn.Linear(1024, 16),   # layer 1 -> 1024 input features (512 from cough + 512 from speech)
-            nn.ReLU(),       
-            nn.Dropout(0.4),
-            nn.Linear(16, num_classes) #output layer
-        )
 
-    def _forward_single(self, cough_images, speech_images):
+        # Classifier: Logistic Regression on concatenated (1024)
+        self.classifier = nn.Linear(1024, num_classes)
+
+    def _encode_modality(self, images, attn_pooler):
+        """Encode a list of images and apply attention pooling."""
         device = next(self.parameters()).device
-
-        # --- Cough: encode each spectrogram separately, then join ---
-        c_feats_list = []
-        for img in (cough_images or []):
-            img = img.to(device=device, dtype=torch.float32)
-            if img.dim() == 3:
-                img = img.unsqueeze(0)          # [1, 3, 224, 224] ->resnet expects a batch dimension
-            feat = self.pool(self.backbone(img)).flatten(1)   # [1, 512]
-            c_feats_list.append(feat)
-
-        if c_feats_list:
-            c_feats = torch.cat(c_feats_list, dim=0)   # [N, 512] -- "joined" outputs
-            c_avg = c_feats.max(dim=0, keepdim=True).values  # [1, 512]
-        else:
-            c_avg = torch.zeros(1, 512, device=device)
-
-        # --- Speech: same pattern ---
-        s_feats_list = []
-        for img in (speech_images or []):
+        feats_list = []
+        for img in (images or []):
             img = img.to(device=device, dtype=torch.float32)
             if img.dim() == 3:
                 img = img.unsqueeze(0)
-            feat = self.pool(self.backbone(img)).flatten(1)
-            s_feats_list.append(feat)
-
-        if s_feats_list:
-            s_feats = torch.cat(s_feats_list, dim=0)
-            s_avg = s_feats.max(dim=0, keepdim=True).values
+            feat = self.pool(self.backbone(img)).flatten(1)  # (1,512)
+            feats_list.append(feat)
+        if feats_list:
+            feats = torch.cat(feats_list, dim=0)  # (N,512)
+            pooled = attn_pooler(feats)            # (512,)
         else:
-            s_avg = torch.zeros(1, 512, device=device)
+            pooled = torch.zeros(512, device=device)
+        return pooled
 
-        fused = torch.cat([c_avg, s_avg], dim=1)  # [1, 1024]
-        return self.classifier(fused)
+    def _forward_single(self, cough_images, speech_images):
+        c_avg = self._encode_modality(cough_images, self.cough_attn)
+        s_avg = self._encode_modality(speech_images, self.speech_attn)
+        fused = torch.cat([c_avg, s_avg])  # (1024,)
+        return self.classifier(fused.unsqueeze(0))  # (1,num_classes)
 
     def forward(self, cough_images, speech_images):
         if isinstance(cough_images, (list, tuple)) and len(cough_images) > 0 and isinstance(cough_images[0], (list, tuple)):
@@ -155,40 +136,42 @@ class PatientIntermediateClassifier(nn.Module):
                 logits.append(self._forward_single(c_imgs, s_imgs))
             return torch.cat(logits, dim=0)
         return self._forward_single(cough_images, speech_images)
-# ------------------------------------------------------------------
-# 3. TRUE EARLY FUSION (One ResNet on stacked images)
-# ------------------------------------------------------------------
+
+
+# ======================================================================
+# 3. True Early Fusion (One ResNet on stacked images + attention pooling)
+# ======================================================================
 class PatientEarlyImageClassifier(nn.Module):
     def __init__(self, num_classes=2, freeze_backbone=True):
         super().__init__()
         resnet = resnet18(weights='IMAGENET1K_V1')
-        self.backbone = nn.Sequential(*list(resnet.children())[:-2])  #-> remove the last two layers (avgpool and fc), allows to use resnet18 as an encoder.
+        self.backbone = nn.Sequential(*list(resnet.children())[:-2])  # remove avgpool & fc
         self.pool = nn.AdaptiveAvgPool2d(1)
 
-        if not freeze_backbone:
-            for name, param in resnet.named_parameters():
-                param.requires_grad = 'layer4' in name   # freeze everything except layer4
-        else:
+        if freeze_backbone:
             for param in resnet.parameters():
                 param.requires_grad = False
-        #MLP CLASSIFIER
-        self.classifier = nn.Sequential(
-            nn.Linear(512, 4),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(4, num_classes)
-        )
+        else:
+            for name, param in resnet.named_parameters():
+                param.requires_grad = 'layer4' in name
+
+        # Self‑Attention Pooling replaces mean pooling
+        self.attention_pool = SelfAttentionPool(dim=512)
+
+        # Classifier: Logistic Regression (Linear 512→2)
+        self.classifier = nn.Linear(512, num_classes)
 
     def _forward_single(self, fused_images):
         device = next(self.parameters()).device
         batch = _prepare_image_batch(fused_images, device)
 
         if batch.numel() > 0:
-            feats = self.pool(self.backbone(batch)).flatten(1)
-            avg_feat = feats.mean(dim=0, keepdim=True)
+            feats = self.pool(self.backbone(batch)).flatten(1)  # (N,512)
+            pooled = self.attention_pool(feats)                  # (512,)
         else:
-            avg_feat = torch.zeros(1, 512, device=device)
-        return self.classifier(avg_feat)
+            pooled = torch.zeros(512, device=device)
+
+        return self.classifier(pooled.unsqueeze(0))  # (1,num_classes)
 
     def forward(self, fused_images):
         if isinstance(fused_images, (list, tuple)) and len(fused_images) > 0 and isinstance(fused_images[0], (list, tuple)):
@@ -199,9 +182,9 @@ class PatientEarlyImageClassifier(nn.Module):
         return self._forward_single(fused_images)
 
 
-# ------------------------------------------------------------------
-# 4. Training and Evaluation Functions (with dynamic threshold)
-# ------------------------------------------------------------------
+# ======================================================================
+# 4. Training and Evaluation Functions
+# ======================================================================
 def _flatten_labels(batch):
     if isinstance(batch, (list, tuple)):
         label_tensor = batch[-1]
@@ -248,12 +231,8 @@ def train_validate(train_data, dev_data, test_data, model, params):
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=3
     )
-    criterion = torch.nn.CrossEntropyLoss()   # no class weights
-
-    best_dev_auc = 0.0
-    best_model_state = None
-    patience_counter = 0
-    patience = 5
+    # Label smoothing prevents overconfidence
+    criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
 
     dev_acc, dev_auc, test_acc, test_auc = 0.0, 0.0, 0.0, 0.0
 
@@ -286,18 +265,7 @@ def train_validate(train_data, dev_data, test_data, model, params):
             test_acc = (test_preds == test_labels).float().mean().item()
             test_auc = metrics.roc_auc_score(test_labels, test_probs) if len(torch.unique(test_labels)) == 2 else 0.5
 
-        # --- Early stopping based on dev AUC ---
-        if dev_auc > best_dev_auc:
-            best_dev_auc = dev_auc
-            best_model_state = model.state_dict()
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                print(f"Early stopping at epoch {epoch+1}")
-                break
-
-        # Use train_loss for the scheduler (dev_loss not computed)
+        # Use train_loss for the scheduler (no early stopping)
         scheduler.step(train_loss)
 
         with open("logs/per_epoch_loss.txt", "a") as f:
@@ -307,10 +275,6 @@ def train_validate(train_data, dev_data, test_data, model, params):
                     f"Best Thresh: {best_thresh:.2f}\n")
         print(f"[epoch {epoch+1}] train_loss={train_loss:.4f}, "
               f"dev_auc={dev_auc:.4f}, best_thresh={best_thresh:.2f}")
-
-    # Restore best model
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state)
 
     return dev_acc, dev_auc, test_acc, test_auc
 
@@ -339,4 +303,4 @@ def train_epoch(train_data, model, optimizer, criterion):
         optimizer.step()
         total_loss += loss.item()
         num_samples += labels.size(0)
-    return total_loss / num_samples #->average loss per sample
+    return total_loss / num_samples

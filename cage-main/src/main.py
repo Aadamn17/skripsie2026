@@ -9,14 +9,14 @@ from model_scripts import *
 # ------------------------------------------------------------------
 grid = {
     'loss_selected': ["cross_entropy_resnet"],
-    'test_set': [0,1,2,3,4,5,6,7,8,9],
-    'dev_set': [0,1,2,3,4,5,6,7,8,9], 
+    'test_set': [1],
+    'dev_set': [0], 
     'num_epochs': [32],
     'batch_size': [32],        
-    'learning_rate': [5e-5],
-    'weight_decay': [5e-5],
+    'learning_rate': [1e-5],
+    'weight_decay': [1e-5],
     'dataset': ["cage"],
-    'arch': ["resnet18"], #lr,resnet18
+    'arch': ["lr"], #lr,resnet18
     # 'fusion': ["intermediate_feature", "early_image", "none"]  # Uncomment to run all
     'fusion': ["early_image"]  # Uncomment to run all
 }
