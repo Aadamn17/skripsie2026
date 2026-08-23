@@ -325,7 +325,7 @@ class PatientEarlyImageDataset(Dataset):
             s_norm = (s_raw - self.speech_mean) / self.speech_std
             s_img = self._to_image(s_norm)
 
-            stacked = torch.stack([c_img, s_img, (c_img + s_img) / 2], dim=0)  # (3,224,224)
+            stacked = torch.stack([c_img, s_img, (c_img * s_img)], dim=0)  # (3,224,224)
             fused_images.append(stacked)
 
         return fused_images, label
