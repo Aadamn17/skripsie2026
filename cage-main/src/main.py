@@ -75,7 +75,7 @@ def main(grid):
                 loss=point['loss_selected'], batch_size=point['batch_size'],
                 num_outer_folds=10
             )
-            model = PatientEarlyImageClassifier(num_classes=2,freeze_backbone=True).to(device)
+            model = resnet18(num_classes=2).to(device)
 
         else:
             raise ValueError(f"Unknown fusion method: {point['fusion']}")
