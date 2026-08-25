@@ -1,112 +1,201 @@
 import os
-import random
-import torch
-import numpy as np
-import pandas as pd
-from scipy.io import wavfile
-from torch.utils.data import Dataset, DataLoader, ConcatDataset
-import torch.nn.functional as F
+import torch # type: ignore
+import numpy as np # type: ignore
+import pandas as pd # type: ignore
+from scipy.io import wavfile # type: ignore
+from torch.utils.data import Dataset, DataLoader, ConcatDataset # type: ignore
 
-def _filter_existing_files(df, base_dir, id_col="Cough_ID"):
-    if df.empty:
-        return df.copy()
-    existing_mask = df[id_col].astype(str).map(
-        lambda cid: os.path.exists(os.path.join(base_dir, cid + ".npy"))
-    )
-    return df.loc[existing_mask].reset_index(drop=True)
+def get_data(dataset, data_folds, i, j, dir, loss, batch_size, num_outer_folds=10):
+    """
+    dataset : string that indicates which dataset is being loaded, ("hyfe" or "cage")
+    data_folds: path to the folds that contain the patients and their label for each cross validation fold
+    i: integer that indicates the fold that is held out for development
+    j: integer that indicates the fold that is held out for testing   
+    dir: path to mel-spectrogram directory
+    loss: string that is used to load data according to the model ("cross_entropy" for LR, "cross_entropy_resnet" for Resnet)
+    batch_size: integer indicating the number of coughs in one batch
+    num_outer_folds: integer indicating the number of cross-validation outer folds into which the data will be divided
 
-# ======================================================================
-# Helper functions: compute mean & std per frequency bin
-# ======================================================================
-def get_mean_std_cough(train_set_files, dataset, cough_dir, inner_bins=128):
+    Returns dataloaders with the training, development and test data
+    """
+    train_data = None
+    val_data = None
+    test_data = None
+
+    # Get all the folds in the training set, which excludes the test and dev set folds.
+    train_set_files = []    
+    for k in range(num_outer_folds):
+        if not k==j and not k==i:
+            train_set_files.append(data_folds + "/fold_" + str(k))
+            
+    dev_set_file = data_folds + "/fold_" + str(j)
+    test_set_file = data_folds + "/fold_" + str(i)
+    
+    # Calculate the mean and standard devation of the training dataset for dataset normalisation
+    mean, std = get_mean_std(train_set_files, dataset, dir, 128)
+
+    # Get all the training data using a dataloader class
+    train_data_set = ConcatDataset([CoughDatasetCleaned(dataset, file + ".csv", dir, loss, mean=mean, std=std) for file in train_set_files])
+    train_data = DataLoader(train_data_set, batch_size=batch_size, num_workers=4, shuffle=True, drop_last=True)
+    
+    # Get all the development/validation data using a dataloader class if development data is not None
+    if not j is None:
+        val_data_set = CoughDatasetCleaned(dataset, dev_set_file+".csv", dir, loss, mean=mean, std=std)
+        val_data = DataLoader(val_data_set, batch_size=batch_size, num_workers=4, shuffle=True, drop_last=True)
+    else: val_data = None
+
+    # Get all the test data using a dataloader class if development data is not None
+    if not i is None:
+        test_data_set = CoughDatasetCleaned(dataset, test_set_file+".csv", dir, loss, mean=mean, std=std)
+        test_data = DataLoader(test_data_set, batch_size=batch_size, num_workers=4, shuffle=True, drop_last=True)
+    else: test_data = None
+
+    return train_data, val_data, test_data
+
+def get_mean_std(train_set_files, dataset, dir, inner_bins=128): 
+    """
+    Calculate the mean and standard deviation of the training data for dataset normalisation.
+    train_set_files: list of file paths to the folds that contain the patients and their labels for all the training data
+    dataset: string that indicates which dataset is being loaded, ("hyfe" or "cage")
+    dir: path to mel-spectrogram directory
+    inner_bins: number of frequency bins
+    
+    Returns the mean and standard deviation of the training dataset.
+    """   
     train_data_set = EmptyDataset()
     for file in train_set_files:
-        train_data_set = ConcatDataset([train_data_set, CoughDataset(dataset, file+".csv", cough_dir, inner_bins)])
+        train_data_set = ConcatDataset([train_data_set, CoughDataset(dataset, file+".csv", dir, inner_bins)])
+        
     mels = []
     train_loader = DataLoader(train_data_set, batch_size=100, num_workers=1)
     for images, _ in train_loader:
         mels.append(images)
+
     mels = torch.cat(mels, dim=0)
-    perc = int(2/3 * mels.shape[1])
+    perc = int(2/3*mels.shape[1])
     mean = torch.mean(mels[:,:perc,:], dim=(0,1))
     std = torch.std(mels[:,:perc,:], dim=(0,1))
+
     return mean, std
 
-def get_mean_std_speech(train_set_files, dataset, speech_dir, inner_bins=128):
-    train_data_set = EmptyDataset()
-    for file in train_set_files:
-        train_data_set = ConcatDataset([train_data_set, SpeechDataset(dataset, file+".csv", speech_dir, inner_bins)])
-    mels = []
-    train_loader = DataLoader(train_data_set, batch_size=100, num_workers=1)
-    for images, _ in train_loader:
-        mels.append(images)
-    mels = torch.cat(mels, dim=0)
-    perc = int(2/3 * mels.shape[1])
-    mean = torch.mean(mels[:,:perc,:], dim=(0,1))
-    std = torch.std(mels[:,:perc,:], dim=(0,1))
-    return mean, std
-
-# ======================================================================
-# EmptyDataset
-# ======================================================================
 class EmptyDataset(Dataset):
-    def __init__(self): pass
-    def __len__(self): return 0
-    def __getitem__(self, index): raise IndexError("Empty dataset cannot be indexed")
+    def __init__(self):
+        pass
 
-# ======================================================================
-# Raw dataset classes (used for mean/std computation)
-# ======================================================================
+    def __len__(self):
+        return 0
+
+    def __getitem__(self, index):
+        raise IndexError("Empty dataset cannot be indexed")
+    
 class CoughDataset(Dataset):
-    def __init__(self, dataset, annotations_file, cough_dir, bins=128):
-        self.dir = cough_dir
+    """
+    Custom Dataset class that loads in the data and returns the plain cough images and labels
+    
+    dataset: string that indicates which dataset is being loaded, ("hyfe" or "cage")
+    annotations_file: path to the csv file that contains the patients and their labels
+    dir: path to mel-spectrogram directory
+    bins: number of frequency bins
+    
+    Returns the mel-spectrogram image and the label for each cough recording
+    """
+    def __init__(self, dataset, annotations_file, dir, bins=128):
+        self.labels = pd.read_csv(annotations_file)
+        self.dir = dir
         self.dataset = dataset
-        raw_df = pd.read_csv(annotations_file)
-        self.labels = _filter_existing_files(raw_df, self.dir)
+        
+    def __len__(self):
+        return len(self.labels)
+    
+    def __getitem__(self, idx):
+        label = self.labels["Status"][idx] 
+        path = os.path.join(self.dir, str(self.labels["Cough_ID"][idx])+".npy")
+        image = torch.tensor(np.transpose(np.load(path)))
+        image = image[:50,:]
+
+        if self.dataset == "hyfe" and image.shape[0]<40: image = torch.nn.functional.pad(image, (0,0,(40-image.shape[0]),0), "constant", 0)
+        if self.dataset == "cage" and image.shape[0]<50: image = torch.nn.functional.pad(image, (0,0,(50-image.shape[0]),0), "constant", 0)
+
+        return image, label
+    
+class CoughDatasetCleaned(Dataset):
+    """
+    Custom Dataset Class that loads in the coughs as tensors, pads the frequency bins, standardises the coughs with the entire training set mean and standard deviation and returns the mean of the tensors and the labels for the LR or Resnet models.
+    
+    dataset: string that indicates which dataset is being loaded, ("hyfe" or "cage")
+    annotations_file: path to the csv file that contains the patients and their labels
+    dir: path to mel-spectrogram directory
+    loss: string that is used to load data according to the model ("cross_entropy" for LR, "cross_entropy_resnet" for Resnet)
+    mean: mean of the training data
+    std: standard deviation of the training data
+    
+    Returns the mel-spectrogram image and the label for each cough recording
+    """
+    def __init__(self, dataset, annotations_file, dir, loss, mean, std):
+        self.labels = pd.read_csv(annotations_file)
+        self.dataset = dataset
+        self.dir = dir
+        self.loss = loss
+        self.mean = mean
+        self.std = std
 
     def __len__(self):
         return len(self.labels)
 
     def __getitem__(self, idx):
-        label = self.labels["Status"][idx]
-        path = os.path.join(self.dir, str(self.labels["Cough_ID"][idx]) + ".npy")
-        image = torch.tensor(np.transpose(np.load(path)))
-        image = image[:50, :]
-        if self.dataset == "hyfe" and image.shape[0] < 40:
-            image = torch.nn.functional.pad(image, (0,0,(40-image.shape[0]),0), "constant", 0)
-        if self.dataset == "cage" and image.shape[0] < 50:
-            image = torch.nn.functional.pad(image, (0,0,(50-image.shape[0]),0), "constant", 0)
-        return image, label
+        if self.dataset == "hyfe" or self.dataset == "cage":
+            label = self.labels["Status"][idx]   
+ 
+            path = os.path.join(self.dir, str(self.labels["Cough_ID"][idx])+".npy")
+            image_raw = torch.tensor(np.transpose(np.load(path)))
+            
+            # Load in raw audio if needed:
+            if self.dataset == "cage": audio_raw = wavfile.read(os.path.join(self.dir.replace("mel_spectrograms_128", "audio"), str(self.labels["Cough_ID"][idx]).replace("/", "/cough_")+".wav"))[1]
+            elif self.dataset == "hyfe": audio_raw = wavfile.read(os.path.join(self.dir.replace("mel_spectrograms_128", "audio"), str(self.labels["Cough_ID"][idx])+"-recording-1.wav"))[1]
+
+            if self.dataset == "cage" and image_raw.shape[0]<40: image_raw = torch.nn.functional.pad(image_raw, (0,0,(40-image_raw.shape[0]),0), "constant", image_raw.min())
+            if self.dataset == "hyfe" and image_raw.shape[0]<40: image_raw = torch.nn.functional.pad(image_raw, (0,0,(40-image_raw.shape[0]),0), "constant", image_raw.min())
+
+            if self.loss == "cross_entropy": 
+                image = self.standardize(image_raw)
+                image_mean = image.mean(0)
+                return image_mean, label
+            elif self.loss == 'cross_entropy_resnet':
+                return self.pad(self.standardize(self.repeat(image_raw))), label
+
+    def repeat(self, image):
+        image = image[None, :, :]
+        image = torch.concat((image, image, image))
+        return image
+
+    def pad(self,image):
+        if (image.shape[-1] < 224) or (image.shape[-2] < 224):
+            pad_width = ((0,0), (0, 224 - image.shape[-2]), (0, 224 - image.shape[-1]))
+            image = np.pad(image, pad_width=pad_width, constant_values=0)
+        return image
+
+    def standardize(self, image):
+        image = (image - self.mean)/self.std
+        return image
+
 
 class SpeechDataset(Dataset):
-    def __init__(self, dataset, annotations_file, speech_dir, bins=128):
-        self.dir = speech_dir
+    """
+    Custom Dataset Class that loads in the speech as tensors, pads the frequency bins, standardises the speech with the entire training set mean and standard deviation and returns the mean of the tensors and the labels for the LR or Resnet models.
+    
+    dataset: string that indicates which dataset is being loaded, ("hyfe" or "cage")
+    annotations_file: path to the csv file that contains the patients and their labels
+    dir: path to mel-spectrogram directory
+    loss: string that is used to load data according to the model ("cross_entropy" for LR, "cross_entropy_resnet" for Resnet)
+    mean: mean of the training data
+    std: standard deviation of the training data
+    
+    Returns the mel-spectrogram image and the label for each cough recording
+    """
+    def __init__(self, dataset, annotations_file, dir, loss, mean, std):
+        self.labels = pd.read_csv(annotations_file)
         self.dataset = dataset
-        raw_df = pd.read_csv(annotations_file)
-        self.labels = _filter_existing_files(raw_df, self.dir)
-
-    def __len__(self):
-        return len(self.labels)
-
-    def __getitem__(self, idx):
-        label = self.labels["Status"][idx]
-        path = os.path.join(self.dir, str(self.labels["Cough_ID"][idx]) + ".npy")
-        image = torch.tensor(np.transpose(np.load(path)))
-        image = image[:50, :]
-        if self.dataset == "hyfe" and image.shape[0] < 40:
-            image = torch.nn.functional.pad(image, (0,0,(40-image.shape[0]),0), "constant", 0)
-        if self.dataset == "cage" and image.shape[0] < 50:
-            image = torch.nn.functional.pad(image, (0,0,(50-image.shape[0]),0), "constant", 0)
-        return image, label
-
-# ======================================================================
-# Cleaned dataset classes (single-modality training)
-# ======================================================================
-class CoughDatasetCleaned(Dataset):
-    def __init__(self, dataset, annotations_file, cough_dir, loss, mean, std):
-        self.dataset = dataset
-        self.dir = cough_dir
-        self.labels = _filter_existing_files(pd.read_csv(annotations_file), self.dir)
+        self.dir = dir
         self.loss = loss
         self.mean = mean
         self.std = std
@@ -115,283 +204,21 @@ class CoughDatasetCleaned(Dataset):
         return len(self.labels)
 
     def __getitem__(self, idx):
-        label = self.labels["Status"][idx]
-        path = os.path.join(self.dir, str(self.labels["Cough_ID"][idx]) + ".npy")
-        image_raw = torch.tensor(np.transpose(np.load(path)))
-        image = (image_raw - self.mean) / self.std
-        if self.loss == "cross_entropy":
-            return image.mean(0), label
-        elif self.loss == 'cross_entropy_resnet':
-            image = self.repeat(image)
-            image = self.pad(image)
-            return image, label
+        if self.dataset == "hyfe" or self.dataset == "cage":
+            label = self.labels["Status"][idx]   
+            image_list = []
+            path = os.path.join(self.dir, str(self.labels["Speech_ID"][idx])+".npy")
+            for images in np.load(path, allow_pickle=True):
+                images = self.standardize(raw_images = torch.tensor(np.transpose(images))) #same filter banks but images have different lengths for each utterance, which doesnt matter since we will be averaging the images for each patient
+                image_list.append(images) #list of standardized images for each patient
+            final_patient_image = torch.cat(image_list, dim=1) #get one large tensor for each patient with all the coughs concatenated in the dim=1
+            final_patient_image_mean = final_patient_image.mean(0)
 
-    def repeat(self, image):
-        image = image[None, :, :]
-        return torch.concat((image, image, image), dim=0)
+            return final_patient_image_mean, label
+        
+    def standardize(self, raw_images):
+        standardized_images = (raw_images - self.mean)/self.std
+        return standardized_images
+    
 
-    def pad(self, image):
-        if (image.shape[-1] < 224) or (image.shape[-2] < 224):
-            pad_width = ((0,0), (0, 224 - image.shape[-2]), (0, 224 - image.shape[-1]))
-            image = np.pad(image, pad_width=pad_width, constant_values=0)
-        return image
-
-class SpeechDatasetCleaned(Dataset):
-    def __init__(self, dataset, annotations_file, speech_dir, loss, mean, std):
-        self.dataset = dataset
-        self.dir = speech_dir
-        self.labels = _filter_existing_files(pd.read_csv(annotations_file), self.dir)
-        self.loss = loss
-        self.mean = mean
-        self.std = std
-
-    def __len__(self):
-        return len(self.labels)
-
-    def __getitem__(self, idx):
-        label = self.labels["Status"][idx]
-        path = os.path.join(self.dir, str(self.labels["Cough_ID"][idx]) + ".npy")
-        image_raw = torch.tensor(np.transpose(np.load(path)))
-        image = (image_raw - self.mean) / self.std
-        if self.loss == "cross_entropy":
-            return image.mean(0), label
-        elif self.loss == 'cross_entropy_resnet':
-            image = self.repeat(image)
-            image = self.pad(image)
-            return image, label
-
-    def repeat(self, image):
-        image = image[None, :, :]
-        return torch.concat((image, image, image), dim=0)
-
-    def pad(self, image):
-        if (image.shape[-1] < 224) or (image.shape[-2] < 224):
-            pad_width = ((0,0), (0, 224 - image.shape[-2]), (0, 224 - image.shape[-1]))
-            image = np.pad(image, pad_width=pad_width, constant_values=0)
-        return image
-
-# ======================================================================
-# Data augmentation function (SpecAugment)
-# ======================================================================
-def apply_spec_augment(img):
-    """
-    Applies random frequency and time masking to a 2D spectrogram tensor.
-    img: (H, W) tensor (freq, time)
-    Returns augmented img.
-    """
-    # Frequency masking
-    f_start = torch.randint(0, img.size(0), (1,)).item()
-    f_len = torch.randint(10, 30, (1,)).item()
-    if f_start + f_len < img.size(0):
-        img[f_start:f_start+f_len, :] = 0
-
-    # Time masking
-    t_start = torch.randint(0, img.size(1), (1,)).item()
-    t_len = torch.randint(10, 30, (1,)).item()
-    if t_start + t_len < img.size(1):
-        img[:, t_start:t_start+t_len] = 0
-
-    return img
-
-# ======================================================================
-# 5. Patient dataset for INTERMEDIATE FUSION (Separate encoders)
-# ======================================================================
-class PatientIntermediateDataset(Dataset):
-    def __init__(self, annotations_file, cough_dir, speech_dir,
-                 cough_mean, cough_std, speech_mean, speech_std, is_train=False):
-        self.df = pd.read_csv(annotations_file)
-        self.df['patient_id'] = self.df['Cough_ID'].astype(str).apply(lambda x: x.split('/')[0])
-        self.df = self.df[self.df['Cough_ID'].astype(str).map(
-            lambda cid: os.path.exists(os.path.join(cough_dir, cid + ".npy"))
-        )].reset_index(drop=True)
-        self.patients = self.df.groupby('patient_id').agg({
-            'Cough_ID': list,
-            'Status': 'first'
-        }).reset_index()
-        self.cough_dir = cough_dir
-        self.speech_dir = speech_dir
-        self.cough_mean = cough_mean
-        self.cough_std = cough_std
-        self.speech_mean = speech_mean
-        self.speech_std = speech_std
-        self.is_train = is_train
-
-    def __len__(self):
-        return len(self.patients)
-
-    def _to_image(self, tensor):
-        if tensor.ndim == 2:
-            tensor = tensor.unsqueeze(0)
-        tensor = tensor.unsqueeze(0)
-        tensor = F.interpolate(tensor, size=(224, 224), mode='bilinear', align_corners=False)
-        img = tensor[0, 0, :, :]
-        # Augmentation only during training
-        if self.is_train:
-            img = apply_spec_augment(img)
-        return img.unsqueeze(0).repeat(3, 1, 1)
-
-    def __getitem__(self, idx):
-        row = self.patients.iloc[idx]
-        patient_id = row['patient_id']
-        label = row['Status']
-
-        cough_images = []
-        for cid in row['Cough_ID']:
-            path = os.path.join(self.cough_dir, str(cid) + ".npy")
-            if not os.path.exists(path):
-                continue
-            raw = torch.tensor(np.transpose(np.load(path)))
-            norm = (raw - self.cough_mean) / self.cough_std
-            cough_images.append(self._to_image(norm))
-
-        speech_images = []
-        speech_folder = os.path.join(self.speech_dir, patient_id)
-        if os.path.isdir(speech_folder):
-            for fname in os.listdir(speech_folder):
-                if fname.endswith('.npy'):
-                    path = os.path.join(speech_folder, fname)
-                    raw = torch.tensor(np.transpose(np.load(path)))
-                    norm = (raw - self.speech_mean) / self.speech_std
-                    speech_images.append(self._to_image(norm))
-
-        return cough_images, speech_images, label
-
-# ======================================================================
-# 6. Patient dataset for TRUE EARLY FUSION (One encoder)
-# ======================================================================
-class PatientEarlyImageDataset(Dataset):
-    def __init__(self, annotations_file, cough_dir, speech_dir,
-                 cough_mean, cough_std, speech_mean, speech_std, is_train=False):
-        self.df = pd.read_csv(annotations_file)
-        self.df['patient_id'] = self.df['Cough_ID'].astype(str).apply(lambda x: x.split('/')[0])
-        self.df = self.df[self.df['Cough_ID'].astype(str).map(
-            lambda cid: os.path.exists(os.path.join(cough_dir, cid + ".npy"))
-        )].reset_index(drop=True)
-        self.patients = self.df.groupby('patient_id').agg({
-            'Cough_ID': list,
-            'Status': 'first'
-        }).reset_index()
-        self.cough_dir = cough_dir
-        self.speech_dir = speech_dir
-        self.cough_mean = cough_mean
-        self.cough_std = cough_std
-        self.speech_mean = speech_mean
-        self.speech_std = speech_std
-        self.is_train = is_train
-
-    def __len__(self):
-        return len(self.patients)
-
-    def _to_image(self, tensor):
-        if tensor.ndim == 2:
-            tensor = tensor.unsqueeze(0)
-        tensor = tensor.unsqueeze(0)
-        tensor = F.interpolate(tensor, size=(224, 224), mode='bilinear', align_corners=False)
-        img = tensor[0, 0, :, :]
-        # Augmentation only during training
-        if self.is_train:
-            img = apply_spec_augment(img)
-        return img  # (224,224) for stacking
-
-    def __getitem__(self, idx):
-        row = self.patients.iloc[idx]
-        patient_id = row['patient_id']
-        label = row['Status']
-        cough_ids = [cid for cid in row['Cough_ID'] if os.path.exists(os.path.join(self.cough_dir, str(cid) + ".npy"))]
-
-        speech_folder = os.path.join(self.speech_dir, patient_id)
-        speech_files = []
-        if os.path.isdir(speech_folder):
-            speech_files = [f.replace('.npy', '') for f in os.listdir(speech_folder) if f.endswith('.npy')]
-
-        if len(cough_ids) > 1:
-            random.shuffle(cough_ids)
-        if len(speech_files) > 1:
-            random.shuffle(speech_files)
-
-        n_pairs = min(len(cough_ids), len(speech_files))
-        fused_images = []
-        for i in range(n_pairs):
-            cid = str(cough_ids[i])
-            sid = str(speech_files[i])
-
-            c_path = os.path.join(self.cough_dir, cid + ".npy")
-            c_raw = torch.tensor(np.transpose(np.load(c_path)))
-            c_norm = (c_raw - self.cough_mean) / self.cough_std
-            c_img = self._to_image(c_norm)
-
-            s_path = os.path.join(self.speech_dir, patient_id, sid + ".npy")
-            s_raw = torch.tensor(np.transpose(np.load(s_path)))
-            s_norm = (s_raw - self.speech_mean) / self.speech_std
-            s_img = self._to_image(s_norm)
-
-            stacked = torch.stack([c_img, s_img, (c_img * s_img)], dim=0)  # (3,224,224)
-            fused_images.append(stacked)
-
-        return fused_images, label
-
-# ======================================================================
-# 7. Loader functions (pass is_train flag)
-# ======================================================================
-def _patient_intermediate_collate(batch):
-    cough_batch, speech_batch, labels = [], [], []
-    for cough_images, speech_images, label in batch:
-        cough_batch.append(cough_images)
-        speech_batch.append(speech_images)
-        labels.append(label)
-    return cough_batch, speech_batch, torch.tensor(labels, dtype=torch.long)
-
-def _patient_early_collate(batch):
-    fused_batch, labels = [], []
-    for fused_images, label in batch:
-        fused_batch.append(fused_images)
-        labels.append(label)
-    return fused_batch, torch.tensor(labels, dtype=torch.long)
-
-def get_cough_data(dataset, data_folds, i, j, cough_dir, loss, batch_size, num_outer_folds=10):
-    train_set_files = [data_folds + "/fold_" + str(k) for k in range(num_outer_folds) if k != j and k != i]
-    dev_set_file = data_folds + "/fold_" + str(j)
-    test_set_file = data_folds + "/fold_" + str(i)
-    mean, std = get_mean_std_cough(train_set_files, dataset, cough_dir, 128)
-    train_data = DataLoader(ConcatDataset([CoughDatasetCleaned(dataset, f+".csv", cough_dir, loss, mean, std) for f in train_set_files]), batch_size=batch_size, num_workers=4, shuffle=True, drop_last=True)
-    val_data = DataLoader(CoughDatasetCleaned(dataset, dev_set_file+".csv", cough_dir, loss, mean, std), batch_size=batch_size, num_workers=4, shuffle=True, drop_last=True) if j is not None else None
-    test_data = DataLoader(CoughDatasetCleaned(dataset, test_set_file+".csv", cough_dir, loss, mean, std), batch_size=batch_size, num_workers=4, shuffle=True, drop_last=True) if i is not None else None
-    return train_data, val_data, test_data
-
-def get_speech_data(dataset, data_folds, i, j, speech_dir, loss, batch_size, num_outer_folds=10):
-    train_set_files = [data_folds + "/fold_" + str(k) for k in range(num_outer_folds) if k != j and k != i]
-    dev_set_file = data_folds + "/fold_" + str(j)
-    test_set_file = data_folds + "/fold_" + str(i)
-    mean, std = get_mean_std_speech(train_set_files, dataset, speech_dir, 128)
-    train_data = DataLoader(ConcatDataset([SpeechDatasetCleaned(dataset, f+".csv", speech_dir, loss, mean, std) for f in train_set_files]), batch_size=batch_size, num_workers=4, shuffle=True, drop_last=True)
-    val_data = DataLoader(SpeechDatasetCleaned(dataset, dev_set_file+".csv", speech_dir, loss, mean, std), batch_size=batch_size, num_workers=4, shuffle=True, drop_last=True) if j is not None else None
-    test_data = DataLoader(SpeechDatasetCleaned(dataset, test_set_file+".csv", speech_dir, loss, mean, std), batch_size=batch_size, num_workers=4, shuffle=True, drop_last=True) if i is not None else None
-    return train_data, val_data, test_data
-
-def get_intermediate_data(dataset, data_folds, i, j, cough_dir, speech_dir, loss, batch_size=1, num_outer_folds=10):
-    train_set_files = [data_folds + "/fold_" + str(k) for k in range(num_outer_folds) if k != j and k != i]
-    dev_set_file = data_folds + "/fold_" + str(j)
-    test_set_file = data_folds + "/fold_" + str(i)
-    c_mean, c_std = get_mean_std_cough(train_set_files, dataset, cough_dir, 128)
-    s_mean, s_std = get_mean_std_speech(train_set_files, dataset, speech_dir, 128)
-    train_data = DataLoader(
-        ConcatDataset([PatientIntermediateDataset(f+".csv", cough_dir, speech_dir, c_mean, c_std, s_mean, s_std, is_train=True) for f in train_set_files]),
-        batch_size=batch_size, num_workers=4, shuffle=True, drop_last=True, collate_fn=_patient_intermediate_collate,
-    )
-    val_data = DataLoader(PatientIntermediateDataset(dev_set_file+".csv", cough_dir, speech_dir, c_mean, c_std, s_mean, s_std, is_train=False), batch_size=batch_size, num_workers=4, shuffle=False, drop_last=True, collate_fn=_patient_intermediate_collate) if j is not None else None
-    test_data = DataLoader(PatientIntermediateDataset(test_set_file+".csv", cough_dir, speech_dir, c_mean, c_std, s_mean, s_std, is_train=False), batch_size=batch_size, num_workers=4, shuffle=False, drop_last=True, collate_fn=_patient_intermediate_collate) if i is not None else None
-    return train_data, val_data, test_data
-
-def get_early_image_data(dataset, data_folds, i, j, cough_dir, speech_dir, loss, batch_size=1, num_outer_folds=10):
-    train_set_files = [data_folds + "/fold_" + str(k) for k in range(num_outer_folds) if k != j and k != i]
-    dev_set_file = data_folds + "/fold_" + str(j)
-    test_set_file = data_folds + "/fold_" + str(i)
-    c_mean, c_std = get_mean_std_cough(train_set_files, dataset, cough_dir, 128)
-    s_mean, s_std = get_mean_std_speech(train_set_files, dataset, speech_dir, 128)
-    train_data = DataLoader(
-        ConcatDataset([PatientEarlyImageDataset(f+".csv", cough_dir, speech_dir, c_mean, c_std, s_mean, s_std, is_train=True) for f in train_set_files]),
-        batch_size=batch_size, num_workers=4, shuffle=True, drop_last=True, collate_fn=_patient_early_collate,
-    )
-    val_data = DataLoader(PatientEarlyImageDataset(dev_set_file+".csv", cough_dir, speech_dir, c_mean, c_std, s_mean, s_std, is_train=False), batch_size=batch_size, num_workers=4, shuffle=False, drop_last=True, collate_fn=_patient_early_collate) if j is not None else None
-    test_data = DataLoader(PatientEarlyImageDataset(test_set_file+".csv", cough_dir, speech_dir, c_mean, c_std, s_mean, s_std, is_train=False), batch_size=batch_size, num_workers=4, shuffle=False, drop_last=True, collate_fn=_patient_early_collate) if i is not None else None
-    return train_data, val_data, test_data
+            
