@@ -192,10 +192,6 @@ class SpeechDatasetCleaned(Dataset):
     def standardize(self, raw_images):
         return (raw_images - self.mean) / self.std
 
-
-# ======================================================================
-# NEW EARLY FUSION DATASET (Flat, each cough = one 3‑channel image)
-# ======================================================================
 class EarlyFusionFlatDataset(Dataset):
     """
     For each patient, compute the mean speech image (over all speech recordings).
@@ -279,24 +275,24 @@ class EarlyFusionFlatDataset(Dataset):
 
         return fused, label
 
-
-# ======================================================================
-# LOADER FOR EARLY FUSION
-# ======================================================================
 def get_early_fusion_data(dataset, data_folds, i, j, cough_dir, speech_dir, loss, batch_size, num_outer_folds=10):
     """
     Returns DataLoaders for the early fusion flat dataset.
     Each sample is a (3,224,224) fused image with the patient's label.
     """
-    train_folds = [data_folds + f"/fold_{k}.csv" for k in range(num_outer_folds) if k != j and k != i]
+    # Build two lists:
+    # train_folds_noext: paths WITHOUT .csv (used by get_mean_std)
+    # train_folds_csv: paths WITH .csv (used by dataset creation)
+    train_folds_noext = [data_folds + f"/fold_{k}" for k in range(num_outer_folds) if k != j and k != i]
+    train_folds_csv = [f + ".csv" for f in train_folds_noext]
     dev_file = data_folds + f"/fold_{j}.csv"
     test_file = data_folds + f"/fold_{i}.csv"
 
-    # Compute means/stds on training folds
-    cough_mean, cough_std = get_mean_std(train_folds, dataset, cough_dir, 128)
-    speech_mean, speech_std = get_speech_mean_std(train_folds, dataset, speech_dir, 128)
+    # Compute means/stds on training folds (pass noext to avoid double .csv)
+    cough_mean, cough_std = get_mean_std(train_folds_noext, dataset, cough_dir, 128)
+    speech_mean, speech_std = get_speech_mean_std(train_folds_noext, dataset, speech_dir, 128)
 
-    train_ds = ConcatDataset([EarlyFusionFlatDataset(f, cough_dir, speech_dir, cough_mean, cough_std, speech_mean, speech_std, is_train=True) for f in train_folds])
+    train_ds = ConcatDataset([EarlyFusionFlatDataset(f, cough_dir, speech_dir, cough_mean, cough_std, speech_mean, speech_std, is_train=True) for f in train_folds_csv])
     val_ds = EarlyFusionFlatDataset(dev_file, cough_dir, speech_dir, cough_mean, cough_std, speech_mean, speech_std, is_train=False) if j is not None else None
     test_ds = EarlyFusionFlatDataset(test_file, cough_dir, speech_dir, cough_mean, cough_std, speech_mean, speech_std, is_train=False) if i is not None else None
 
@@ -310,12 +306,13 @@ def get_early_fusion_data(dataset, data_folds, i, j, cough_dir, speech_dir, loss
     return train_loader, val_loader, test_loader
 
 
-def get_speech_mean_std(train_folds, dataset, speech_dir, inner_bins=128):
+def get_speech_mean_std(train_folds_noext, dataset, speech_dir, inner_bins=128):
     """
     Compute mean/std for speech by scanning all speech files of training patients.
+    Expects `train_folds_noext` (list of fold paths WITHOUT .csv).
     """
     train_data_set = EmptyDataset()
-    for fold in train_folds:
+    for fold in train_folds_noext:
         train_data_set = ConcatDataset([train_data_set, SpeechDataset(dataset, fold + ".csv", speech_dir, inner_bins)])
     mels = []
     loader = DataLoader(train_data_set, batch_size=100, num_workers=1)

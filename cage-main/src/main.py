@@ -1,7 +1,7 @@
 import itertools
 import random
 import torch
-from dataloader import get_early_fusion_data
+from dataloader import *
 from model_scripts import train_validate, ResNet18
 
 grid = {
@@ -14,7 +14,7 @@ grid = {
     'weight_decay': [1e-4],
     'dataset': ["cage"],
     'arch': ["resnet"],
-    'fusion': ["early"]
+    'fusion': ["early"] # "early" or "late" or "none"
 }
 
 cough_dir = "data/cage/mel_spectrograms_128"
@@ -44,6 +44,17 @@ def main(grid):
                 num_outer_folds=10
             )
             model = ResNet18(num_classes=2).to(device)
+        elif point['fusion'] == "none":
+            train, val, test = get_data(
+                dataset=point['dataset'],
+                data_folds = "data/"+point['dataset']+"data_folds_filtered",
+                i=point['test_set'],j=point['dev_set'],
+                cough_dir=cough_dir,
+                loss=point['loss_selected'],
+                batch_size=point['batch_size'],
+                num_outer_folds=10
+            )
+        
         else:
             raise ValueError(f"Unknown fusion: {point['fusion']}")
 

@@ -39,6 +39,9 @@ class ResNet18(nn.Module):
         self.resnet = resnet18() 
         self.resnet.fc = nn.Linear(512, num_classes) 
 
+    def forward(self,x):
+        return self.resnet(x)
+
 def train_validate(train_data, dev_data, test_data, model, params):
     """
     Training and evaluating logic for the model
@@ -107,7 +110,6 @@ def evaluate_epoch(dev_data, model, criterion):
     """
     model.eval()
     cumulative_loss, acc, auc, total_samples = 0, 0, 0, 0
-    outputs = []
     labels = []
     probs = []
     
