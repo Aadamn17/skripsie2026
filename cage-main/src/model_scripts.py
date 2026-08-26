@@ -1,139 +1,142 @@
 # imports
-import torch # type: ignore
-import numpy as np # type: ignore
-from sklearn import metrics # type: ignore
-import torch # type: ignore
-import torch.nn as nn # type: ignore
-from torchvision.models import resnet18 #type: ignore
+import torch
+import numpy as np
+from sklearn import metrics
+import torch.nn as nn
+from torchvision.models import resnet18
 
-# Set device as cude to use the GPU instead of the CPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Logistic regression class
 class Logistic_Regression(nn.Module):
-    """
-    Logistic regression model. 
-    Note that a softmax or sigmoid activation is not applied since this model is used with CrossEntropyLoss which expects the logits.
-    
-    input_dim: number of frequency bins
-    num_classes: number of classes
-    
-    Returns the logits (batch size, 2)
-    """
     def __init__(self, input_dim=128, num_classes=2):
         super(Logistic_Regression, self).__init__()
         self.linear = nn.Linear(input_dim, num_classes)
-        
     def forward(self, x):
-        x = self.linear(x)
-        return x
-    
+        return self.linear(x)
+
+# ResNet18 class (original, no dropout)
 class ResNet18(nn.Module):
-    """
-    ResNet18 model from Pytorch. Last layer is replaced with a linear layer that gives num_classes outputs instead of a 1000.
-    
-    Returns the output probabilities (batch size, 2)
-    """
     def __init__(self, num_classes=2):
         super(ResNet18, self).__init__()
-        self.resnet = resnet18() 
-        self.resnet.fc = nn.Linear(512, num_classes) 
-
-    def forward(self,x):
+        self.resnet = resnet18()
+        self.resnet.fc = nn.Linear(512, num_classes)
+    def forward(self, x):
         return self.resnet(x)
 
 def train_validate(train_data, dev_data, test_data, model, params):
     """
-    Training and evaluating logic for the model
-    
-    train_data: DataLoader object that contains the training data
-    dev_data: DataLoader object that contains the development data
-    test_data: DataLoader object that contains the test data
-    model: LR or ResNet18 model
-    params: parameters selected in current iteration of the grid optimisation
-    
-    Returns the development and test accuracies and AUCs
+    Training and evaluating logic.
+    Returns the development and test accuracies and AUCs from the LAST epoch.
     """
-    # AdamW or Adam can be used for the optimizer
-    # Note that since the Pytorch CrossEntropyLoss is used, the criterion expects the logits not the probabilities, so the LR model does not have a softmax/sigmoid layer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=params["learning_rate"], weight_decay=params['weight_decay'])                                    
+    optimizer = torch.optim.AdamW(model.parameters(), lr=params["learning_rate"],
+                                  weight_decay=params['weight_decay'])
     criterion = torch.nn.CrossEntropyLoss()
 
-    # Train the model and evaluate it on the dev set or the test set for a set number of epochs
-    dev_acc, dev_auc, test_acc, test_auc = 0,0,0,0
+    dev_acc, dev_auc, test_acc, test_auc = 0, 0, 0, 0
     for epoch in range(params["num_epochs"]):
         train_loss = train_epoch(train_data, model, optimizer, criterion)
-        if not dev_data is None: dev_loss, dev_acc, dev_auc = evaluate_epoch(dev_data, model, criterion)
-        if not test_data is None: test_loss, test_acc, test_auc = evaluate_epoch(test_data, model, criterion)
-        with open("logs/per_epoch_loss.txt", "a") as file: file.write(f"Epoch {epoch+1}/{params['num_epochs']}, Train Loss: {train_loss:.4f}, Dev Loss: {dev_loss:.4f}, Test Loss: {test_loss:.4f}, Dev Acc: {dev_acc:.4f}, Dev AUC: {dev_auc:.4f}, Test Acc: {test_acc:.4f}, Test AUC: {test_auc:.4f}\n")
-
+        if dev_data is not None:
+            dev_loss, dev_acc, dev_auc = evaluate_epoch(dev_data, model, criterion)
+        if test_data is not None:
+            test_loss, test_acc, test_auc = evaluate_epoch(test_data, model, criterion)
+        with open("logs/per_epoch_loss.txt", "a") as file:
+            file.write(f"Epoch {epoch+1}/{params['num_epochs']}, Train Loss: {train_loss:.4f}, "
+                       f"Dev Loss: {dev_loss:.4f}, Test Loss: {test_loss:.4f}, "
+                       f"Dev Acc: {dev_acc:.4f}, Dev AUC: {dev_auc:.4f}, "
+                       f"Test Acc: {test_acc:.4f}, Test AUC: {test_auc:.4f}\n")
     return dev_acc, dev_auc, test_acc, test_auc
 
 def train_epoch(train_data, model, optimizer, criterion):
     """
-    Training logic
-    
-    train_data: DataLoader object that contains the training data
-    model: LR or ResNet18 model
-    optimizer: AdamW optimizer
-    criterion: CrossEntroyLoss loss function
-    
-    Returns the cummulative loss for all the batches
+    Training loop. Each batch is (input_data, labels, _) or (input_data, labels) depending on the dataloader.
+    Loss is computed exactly as the original: criterion(output[:,1], labels.float()).
     """
     model.train()
-    cumulative_loss, total_samples, loss = 0, 0,0
-    
+    cumulative_loss, total_samples = 0, 0
+
     for _, input in enumerate(train_data):
-        optimizer.zero_grad()    
-        input_data, labels = input
+        optimizer.zero_grad()
+        # Handle both 2-item and 3-item tuple (if patient ID is present, ignore it)
+        if len(input) == 3:
+            input_data, labels, _ = input
+        else:
+            input_data, labels = input
         labels = labels.to(device)
         input_data = input_data.to(torch.float32).to(device)
         output = model(input_data).to(device)
+
+        # Original loss calculation (as you had it)
         loss = criterion(output[:,1], labels.to(torch.float))
+
         cumulative_loss += loss.item()
         total_samples += input_data.size(0)
-        
+
         loss.backward()
         optimizer.step()
-        
-    cumulative_loss = cumulative_loss/total_samples
+
+    cumulative_loss = cumulative_loss / total_samples
     return cumulative_loss
 
 def evaluate_epoch(dev_data, model, criterion):
     """
-    Evaluating logic
-    
-    dev_data: DataLoader object that contains the development or test data
-    model: LR or ResNet18 model
-    criterion: CrossEntroyLoss loss function
-    
+    Evaluation with patient-level aggregation.
+    Each batch is (input_data, labels, pids) or (input_data, labels).
+    Loss is computed exactly as the original: criterion(output[:,1], labels.float()).
     """
     model.eval()
-    cumulative_loss, acc, auc, total_samples = 0, 0, 0, 0
-    labels = []
-    probs = []
-    
+    cumulative_loss, total_samples = 0, 0
+    patient_probs = {}
+    patient_labels = {}
+
     with torch.no_grad():
-        for steps, input in enumerate(dev_data):
-            input_data, label = input
+        for _, input in enumerate(dev_data):
+            if len(input) == 3:
+                input_data, labels, pids = input
+            else:
+                input_data, labels = input
+                pids = None  # No patient IDs available (use cough-level)
+
             input_data = input_data.to(torch.float32).to(device)
             output = model(input_data).to(device)
-            label = label.to(device).to(torch.float)
-            prob = torch.nn.functional.softmax(output, dim=1)
-            labels.extend(label.detach().cpu().numpy())
-            probs.extend(prob[:,1].detach().cpu().numpy())
-            loss = criterion(output[:,1], label)
+            labels = labels.to(device)
+
+            prob = torch.nn.functional.softmax(output, dim=1)[:, 1]  # p(positive)
+
+            if pids is not None:
+                # Patient-level aggregation
+                for i, pid in enumerate(pids):
+                    if pid not in patient_probs:
+                        patient_probs[pid] = []
+                        patient_labels[pid] = labels[i].item()
+                    patient_probs[pid].append(prob[i].item())
+            else:
+                # Fallback to cough-level if no patient IDs
+                for i in range(len(labels)):
+                    if str(i) not in patient_probs:
+                        patient_probs[str(i)] = []
+                        patient_labels[str(i)] = labels[i].item()
+                    patient_probs[str(i)].append(prob[i].item())
+
+            # Original loss calculation
+            loss = criterion(output[:,1], labels.to(torch.float))
             cumulative_loss += loss.item()
             total_samples += input_data.size(0)
 
-    labels = torch.tensor(labels)
-    probs = torch.tensor(probs)
-    
-    predictions = (probs > 0.5).float()
-    acc = (predictions == labels).float().mean()
-    fpr, tpr, _ = metrics.roc_curve(labels, probs)
-    auc = metrics.auc(fpr, tpr)
-    
-    cumulative_loss = cumulative_loss/total_samples
+    # Aggregate per patient (or per sample if no patient IDs)
+    agg_probs = []
+    agg_labels = []
+    for pid, probs_list in patient_probs.items():
+        agg_probs.append(np.mean(probs_list))
+        agg_labels.append(patient_labels[pid])
 
+    # Compute metrics
+    agg_probs = torch.tensor(agg_probs)
+    agg_labels = torch.tensor(agg_labels)
+    predictions = (agg_probs > 0.5).float()
+    acc = (predictions == agg_labels).float().mean()
+    fpr, tpr, _ = metrics.roc_curve(agg_labels, agg_probs)
+    auc = metrics.auc(fpr, tpr)
+
+    cumulative_loss = cumulative_loss / total_samples
     return cumulative_loss, acc, auc

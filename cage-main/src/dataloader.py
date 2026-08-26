@@ -38,7 +38,6 @@ def get_data(dataset, data_folds, i, j, cough_dir, loss, batch_size, num_outer_f
 def get_mean_std(train_set_files, dataset, dir, inner_bins=128):
     """
     Compute mean/std for a modality (cough or speech).
-    For speech, it scans the speech folders of the training patients.
     """
     train_data_set = EmptyDataset()
     for file in train_set_files:
@@ -192,6 +191,7 @@ class SpeechDatasetCleaned(Dataset):
     def standardize(self, raw_images):
         return (raw_images - self.mean) / self.std
 
+
 class EarlyFusionFlatDataset(Dataset):
     """
     For each patient, compute the mean speech image (over all speech recordings).
@@ -199,7 +199,7 @@ class EarlyFusionFlatDataset(Dataset):
         ch1: cough (standardized, padded to 224x224)
         ch2: mean speech (standardized, padded to 224x224)
         ch3: ch1 * ch2
-    Returns (fused_image, patient_label) for each cough.
+    Returns (fused_image, patient_label, patient_id) for each cough.
     """
     def __init__(self, annotations_file, cough_dir, speech_dir,
                  cough_mean, cough_std, speech_mean, speech_std, is_train=False):
@@ -233,7 +233,7 @@ class EarlyFusionFlatDataset(Dataset):
 
     def _pad_to_224(self, img):
         """
-        Pad a (H,W) tensor to (224,224) using zero padding (original style).
+        Pad a (H,W) tensor to (224,224) using zero padding.
         """
         if img.ndim == 2:
             img = img.unsqueeze(0)   # (1,H,W)
@@ -273,12 +273,17 @@ class EarlyFusionFlatDataset(Dataset):
         ch3 = ch1 * ch2                 # product
         fused = torch.cat([ch1, ch2, ch3], dim=0)  # (3,224,224)
 
-        return fused, label
+        # Gaussian noise augmentation for training only
+        if self.is_train:
+            fused = fused + torch.randn_like(fused) * 0.05   # std = 0.05
+
+        return fused, label, pid   # now returns patient ID
+
 
 def get_early_fusion_data(dataset, data_folds, i, j, cough_dir, speech_dir, loss, batch_size, num_outer_folds=10):
     """
     Returns DataLoaders for the early fusion flat dataset.
-    Each sample is a (3,224,224) fused image with the patient's label.
+    Each sample is a (3,224,224) fused image with the patient's label and ID.
     """
     # Build two lists:
     # train_folds_noext: paths WITHOUT .csv (used by get_mean_std)
@@ -297,8 +302,8 @@ def get_early_fusion_data(dataset, data_folds, i, j, cough_dir, speech_dir, loss
     test_ds = EarlyFusionFlatDataset(test_file, cough_dir, speech_dir, cough_mean, cough_std, speech_mean, speech_std, is_train=False) if i is not None else None
 
     def collate(batch):
-        images, labels = zip(*batch)
-        return torch.stack(images), torch.tensor(labels, dtype=torch.long)
+        images, labels, pids = zip(*batch)
+        return torch.stack(images), torch.tensor(labels, dtype=torch.long), list(pids)
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=4, drop_last=True, collate_fn=collate)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=4, drop_last=False, collate_fn=collate) if val_ds else None
