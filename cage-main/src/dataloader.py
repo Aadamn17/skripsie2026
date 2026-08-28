@@ -330,3 +330,24 @@ def get_speech_mean_std(train_folds_noext, dataset, speech_dir, inner_bins=128):
     mean = torch.mean(mels[:, :perc, :], dim=(0,1))
     std = torch.std(mels[:, :perc, :], dim=(0,1))
     return mean, std
+
+def time_mask(image, T=30):
+    """
+    Apply time masking to a spectrogram image.
+    Randomly selects a time segment of length up to T and masks it.
+    """
+    num_time_steps = image.shape[1]
+    t = np.random.randint(0, T)
+    t0 = np.random.randint(0, num_time_steps - t)
+    image[:, t0:t0+t] = 0
+    return image
+def frequency_mask(image, F=13):
+    """
+    Apply frequency masking to a spectrogram image.
+    Randomly selects a frequency segment of length up to F and masks it.
+    """
+    num_freq_bins = image.shape[0]
+    f = np.random.randint(0, F)
+    f0 = np.random.randint(0, num_freq_bins - f)
+    image[f0:f0+f, :] = 0
+    return image
