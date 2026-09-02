@@ -4,11 +4,91 @@ import numpy as np
 import pandas as pd
 from scipy.io import wavfile
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
+from PIL import ImageOps
 
 # ======================================================================
-# ORIGINAL FUNCTIONS (unchanged)
+# AUGMENTATION FUNCTIONS
 # ======================================================================
-def get_data(dataset, data_folds, i, j, cough_dir, loss, batch_size, num_outer_folds=10):
+
+def time_mask(image, T=30):
+    """
+    Apply time masking to a spectrogram image.
+    Randomly selects a time segment of length up to T and masks it.
+    Expects image: (H, W) or (C, H, W) – masks across last dimension (time).
+    """
+    if image.ndim == 3:
+        # (C, H, W) -> time is last dim
+        num_time_steps = image.shape[2]
+        t = np.random.randint(0, T)
+        t0 = np.random.randint(0, max(1, num_time_steps - t))
+        image[:, :, t0:t0+t] = 0
+    else:
+        # (H, W)
+        num_time_steps = image.shape[1]
+        t = np.random.randint(0, T)
+        t0 = np.random.randint(0, max(1, num_time_steps - t))
+        image[:, t0:t0+t] = 0
+    return image
+
+def frequency_mask(image, F=13):
+    """
+    Apply frequency masking to a spectrogram image.
+    Randomly selects a frequency segment of length up to F and masks it.
+    Expects image: (H, W) or (C, H, W) – masks across first spatial dim (frequency).
+    """
+    if image.ndim == 3:
+        # (C, H, W)
+        num_freq_bins = image.shape[1]
+        f = np.random.randint(0, F)
+        f0 = np.random.randint(0, max(1, num_freq_bins - f))
+        image[:, f0:f0+f, :] = 0
+    else:
+        # (H, W)
+        num_freq_bins = image.shape[0]
+        f = np.random.randint(0, F)
+        f0 = np.random.randint(0, max(1, num_freq_bins - f))
+        image[f0:f0+f, :] = 0
+    return image
+
+def gaussian_noise(image, std=0.05):
+    """
+    Add Gaussian noise to the image.
+    """
+    return image + torch.randn_like(image) * std
+
+def solarisation(image, threshold=0.0):
+    """
+    Tensor-based solarisation: invert pixels above threshold.
+    Assumes image is a torch tensor (normalised, mean 0, std 1).
+    """
+    mask = image > threshold
+    image[mask] = -image[mask]
+    return image
+
+def apply_augmentation(image, aug_type):
+    """
+    Apply the specified augmentation to a tensor image.
+    Supports 'none', 'gaussian_noise', 'frequency_masking', 'time_masking', 'solarisation'.
+    """
+    if aug_type == "none":
+        return image
+    elif aug_type == "gaussian_noise":
+        return gaussian_noise(image)
+    elif aug_type == "frequency_masking":
+        return frequency_mask(image, F=13)
+    elif aug_type == "time_masking":
+        return time_mask(image, T=30)
+    elif aug_type == "solarisation":
+        return solarisation(image, threshold=0.0)
+    else:
+        raise ValueError(f"Unknown augmentation: {aug_type}")
+
+# ======================================================================
+# ORIGINAL DATASET CLASSES (with augmentation support)
+# ======================================================================
+
+def get_data(dataset, data_folds, i, j, cough_dir, loss, batch_size,
+             num_outer_folds=10, augmentation="none"):
     """
     Returns train, val, test DataLoaders for single‑modality cough data.
     """
@@ -18,18 +98,19 @@ def get_data(dataset, data_folds, i, j, cough_dir, loss, batch_size, num_outer_f
     mean, std = get_mean_std(train_set_files, dataset, cough_dir, 128)
 
     train_data_set = ConcatDataset([
-        CoughDatasetCleaned(dataset, file + ".csv", cough_dir, loss, mean, std, "none") for file in train_set_files
+        CoughDatasetCleaned(dataset, file + ".csv", cough_dir, loss, mean, std, "none", augmentation)
+        for file in train_set_files
     ])
     train_data = DataLoader(train_data_set, batch_size=batch_size, num_workers=4, shuffle=True, drop_last=True)
 
     val_data = None
     if j is not None:
-        val_data_set = CoughDatasetCleaned(dataset, dev_set_file + ".csv", cough_dir, loss, mean, std, "none")
+        val_data_set = CoughDatasetCleaned(dataset, dev_set_file + ".csv", cough_dir, loss, mean, std, "none", augmentation)
         val_data = DataLoader(val_data_set, batch_size=batch_size, num_workers=4, shuffle=True, drop_last=True)
 
     test_data = None
     if i is not None:
-        test_data_set = CoughDatasetCleaned(dataset, test_set_file + ".csv", cough_dir, loss, mean, std, "none")
+        test_data_set = CoughDatasetCleaned(dataset, test_set_file + ".csv", cough_dir, loss, mean, std, "none", augmentation)
         test_data = DataLoader(test_data_set, batch_size=batch_size, num_workers=4, shuffle=True, drop_last=True)
 
     return train_data, val_data, test_data
@@ -115,7 +196,7 @@ class SpeechDataset(Dataset):
 
 
 class CoughDatasetCleaned(Dataset):
-    def __init__(self, dataset, annotations_file, dir, loss, mean, std, fusion_type):
+    def __init__(self, dataset, annotations_file, dir, loss, mean, std, fusion_type, augmentation="none"):
         self.labels = pd.read_csv(annotations_file)
         self.dataset = dataset
         self.dir = dir
@@ -123,6 +204,7 @@ class CoughDatasetCleaned(Dataset):
         self.mean = mean
         self.std = std
         self.fusion_type = fusion_type
+        self.augmentation = augmentation
 
     def __len__(self):
         return len(self.labels)
@@ -139,9 +221,14 @@ class CoughDatasetCleaned(Dataset):
                 return image_mean, label
             elif self.loss == 'cross_entropy_resnet':
                 if self.fusion_type == "none":
-                    return self.pad(self.standardize(self.repeat(image_raw))), label
-                # For early fusion we need a different dataset (see below)
-                raise NotImplementedError("Use EarlyFusionDataset for early fusion")
+                    image = self.pad(self.standardize(self.repeat(image_raw)))
+                    # Apply augmentation (only during training is controlled by dataloader shuffle/drop, but we apply unconditionally)
+                    # The dataset itself does not know if it's training; we rely on the caller to set augmentation only for train folds.
+                    if self.augmentation != "none":
+                        image = apply_augmentation(image, self.augmentation)
+                    return image, label
+                else:
+                    raise NotImplementedError("Use EarlyFusionDataset or IntermediateFusionDataset for fusion")
 
     def repeat(self, image):
         image = image[None, :, :]
@@ -202,7 +289,8 @@ class EarlyFusionFlatDataset(Dataset):
     Returns (fused_image, patient_label, patient_id) for each cough.
     """
     def __init__(self, annotations_file, cough_dir, speech_dir,
-                 cough_mean, cough_std, speech_mean, speech_std, is_train=False):
+                 cough_mean, cough_std, speech_mean, speech_std,
+                 is_train=False, augmentation="none"):
         self.df = pd.read_csv(annotations_file)
         self.df['patient_id'] = self.df['Cough_ID'].astype(str).apply(lambda x: x.split('/')[0])
         self.df = self.df[self.df['Cough_ID'].astype(str).map(
@@ -227,6 +315,7 @@ class EarlyFusionFlatDataset(Dataset):
         self.speech_mean = speech_mean
         self.speech_std = speech_std
         self.is_train = is_train
+        self.augmentation = augmentation
 
     def __len__(self):
         return len(self.samples)
@@ -273,33 +362,131 @@ class EarlyFusionFlatDataset(Dataset):
         ch3 = ch1 * ch2                 # product
         fused = torch.cat([ch1, ch2, ch3], dim=0)  # (3,224,224)
 
-        # Gaussian noise augmentation for training only
-        if self.is_train:
-            fused = fused + torch.randn_like(fused) * 0.05   # std = 0.05
+        # Apply augmentation if training
+        if self.is_train and self.augmentation != "none":
+            fused = apply_augmentation(fused, self.augmentation)
 
-        return fused, label, pid   # now returns patient ID
+        return fused, label, pid
 
 
-def get_early_fusion_data(dataset, data_folds, i, j, cough_dir, speech_dir, loss, batch_size, num_outer_folds=10):
+class IntermediateFusionDataset(Dataset):
+    """
+    For each patient, compute the mean speech image (over all speech recordings).
+    Stream 1: coughx3 (standardized, padded to 224x224), giving 3x224x224,
+    Stream 2: mean speech (standardized, padded to 224x224) as a single channel,
+    Returns (cough_img, speech_img, label, patient_id).
+    """
+    def __init__(self, annotations_file, cough_dir, speech_dir,
+                 cough_mean, cough_std, speech_mean, speech_std,
+                 is_train=False, augmentation="none"):
+        self.df = pd.read_csv(annotations_file)
+        self.df['patient_id'] = self.df['Cough_ID'].astype(str).apply(lambda x: x.split('/')[0])
+        self.df = self.df[self.df['Cough_ID'].astype(str).map(
+            lambda cid: os.path.exists(os.path.join(cough_dir, cid + ".npy"))
+        )].reset_index(drop=True)
+        self.patients = self.df.groupby('patient_id').agg({'Cough_ID': list, 'Status': 'first'}).reset_index()
+        # Keep only patients that have a speech folder with at least one file
+        self.patients = self.patients[self.patients['patient_id'].map(
+            lambda pid: os.path.isdir(os.path.join(speech_dir, pid)) and len(os.listdir(os.path.join(speech_dir, pid))) > 0
+        )].reset_index(drop=True)
+        # Flatten list of (cough_id, patient_id, label)
+        self.samples = []
+        for _, row in self.patients.iterrows():
+            pid = row['patient_id']
+            label = int(row['Status'])
+            for cid in row['Cough_ID']:
+                self.samples.append((cid, pid, label))
+        self.cough_dir = cough_dir
+        self.speech_dir = speech_dir
+        self.cough_mean = cough_mean
+        self.cough_std = cough_std
+        self.speech_mean = speech_mean
+        self.speech_std = speech_std
+        self.is_train = is_train
+        self.augmentation = augmentation
+
+    def __len__(self):
+        return len(self.samples)
+
+    def _pad_to_224(self, img):
+        """
+        Pad a (H,W) tensor to (224,224) using zero padding.
+        """
+        if img.ndim == 2:
+            img = img.unsqueeze(0)   # (1,H,W)
+        H, W = img.shape[-2], img.shape[-1]
+        pad_h = max(0, 224 - H)
+        pad_w = max(0, 224 - W)
+        if pad_h > 0 or pad_w > 0:
+            img = torch.nn.functional.pad(img, (0, pad_w, 0, pad_h), "constant", 0)
+        return img[0]  # (224,224)
+
+    def _mean_speech_image(self, pid):
+        folder = os.path.join(self.speech_dir, pid)
+        imgs = []
+        for fname in os.listdir(folder):
+            if fname.endswith('.npy'):
+                raw = torch.tensor(np.transpose(np.load(os.path.join(folder, fname))))
+                norm = (raw - self.speech_mean) / self.speech_std
+                padded = self._pad_to_224(norm)
+                imgs.append(padded)
+        if imgs:
+            return torch.stack(imgs).mean(0)   # (224,224)
+        else:
+            return torch.zeros(224,224)
+
+    def __getitem__(self, idx):
+        cid, pid, label = self.samples[idx]
+
+        # Load and process cough
+        c_raw = torch.tensor(np.transpose(np.load(os.path.join(self.cough_dir, cid + ".npy"))))
+        c_norm = (c_raw - self.cough_mean) / self.cough_std
+        c_img = self._pad_to_224(c_norm)          # (224,224)
+
+        # Mean speech for this patient
+        s_img = self._mean_speech_image(pid)      # (224,224)
+
+        # Build stream 1: 3-channel cough (repeat single channel)
+        stream1 = c_img.unsqueeze(0).repeat(3, 1, 1)   # (3,224,224)
+
+        # Stream 2: single-channel speech (1,224,224)
+        stream2 = s_img.unsqueeze(0)                   # (1,224,224)
+
+        # Apply augmentation if training
+        if self.is_train and self.augmentation != "none":
+            stream1 = apply_augmentation(stream1, self.augmentation)
+            stream2 = apply_augmentation(stream2, self.augmentation)
+
+        return stream1, stream2, label, pid
+
+
+# ======================================================================
+# DATA LOADER FUNCTIONS FOR FUSION
+# ======================================================================
+
+def get_early_fusion_data(dataset, data_folds, i, j, cough_dir, speech_dir,
+                          loss, batch_size, num_outer_folds=10, augmentation="none"):
     """
     Returns DataLoaders for the early fusion flat dataset.
     Each sample is a (3,224,224) fused image with the patient's label and ID.
     """
-    # Build two lists:
-    # train_folds_noext: paths WITHOUT .csv (used by get_mean_std)
-    # train_folds_csv: paths WITH .csv (used by dataset creation)
     train_folds_noext = [data_folds + f"/fold_{k}" for k in range(num_outer_folds) if k != j and k != i]
     train_folds_csv = [f + ".csv" for f in train_folds_noext]
     dev_file = data_folds + f"/fold_{j}.csv"
     test_file = data_folds + f"/fold_{i}.csv"
 
-    # Compute means/stds on training folds (pass noext to avoid double .csv)
     cough_mean, cough_std = get_mean_std(train_folds_noext, dataset, cough_dir, 128)
     speech_mean, speech_std = get_speech_mean_std(train_folds_noext, dataset, speech_dir, 128)
 
-    train_ds = ConcatDataset([EarlyFusionFlatDataset(f, cough_dir, speech_dir, cough_mean, cough_std, speech_mean, speech_std, is_train=True) for f in train_folds_csv])
-    val_ds = EarlyFusionFlatDataset(dev_file, cough_dir, speech_dir, cough_mean, cough_std, speech_mean, speech_std, is_train=False) if j is not None else None
-    test_ds = EarlyFusionFlatDataset(test_file, cough_dir, speech_dir, cough_mean, cough_std, speech_mean, speech_std, is_train=False) if i is not None else None
+    train_ds = ConcatDataset([
+        EarlyFusionFlatDataset(f, cough_dir, speech_dir, cough_mean, cough_std,
+                               speech_mean, speech_std, is_train=True, augmentation=augmentation)
+        for f in train_folds_csv
+    ])
+    val_ds = EarlyFusionFlatDataset(dev_file, cough_dir, speech_dir, cough_mean, cough_std,
+                                    speech_mean, speech_std, is_train=False, augmentation=augmentation) if j is not None else None
+    test_ds = EarlyFusionFlatDataset(test_file, cough_dir, speech_dir, cough_mean, cough_std,
+                                     speech_mean, speech_std, is_train=False, augmentation=augmentation) if i is not None else None
 
     def collate(batch):
         images, labels, pids = zip(*batch)
@@ -330,24 +517,3 @@ def get_speech_mean_std(train_folds_noext, dataset, speech_dir, inner_bins=128):
     mean = torch.mean(mels[:, :perc, :], dim=(0,1))
     std = torch.std(mels[:, :perc, :], dim=(0,1))
     return mean, std
-
-def time_mask(image, T=30):
-    """
-    Apply time masking to a spectrogram image.
-    Randomly selects a time segment of length up to T and masks it.
-    """
-    num_time_steps = image.shape[1]
-    t = np.random.randint(0, T)
-    t0 = np.random.randint(0, num_time_steps - t)
-    image[:, t0:t0+t] = 0
-    return image
-def frequency_mask(image, F=13):
-    """
-    Apply frequency masking to a spectrogram image.
-    Randomly selects a frequency segment of length up to F and masks it.
-    """
-    num_freq_bins = image.shape[0]
-    f = np.random.randint(0, F)
-    f0 = np.random.randint(0, num_freq_bins - f)
-    image[f0:f0+f, :] = 0
-    return image
