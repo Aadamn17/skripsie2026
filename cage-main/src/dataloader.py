@@ -157,7 +157,6 @@ class CoughDataset(Dataset):
         label = self.labels["Status"][idx]
         path = os.path.join(self.dir, str(self.labels["Cough_ID"][idx]) + ".npy")
         image = torch.tensor(np.transpose(np.load(path)))
-        image = image[:50, :]
         if self.dataset == "hyfe" and image.shape[0] < 40:
             image = torch.nn.functional.pad(image, (0,0,40-image.shape[0],0), "constant", 0)
         if self.dataset == "cage" and image.shape[0] < 50:
@@ -222,8 +221,6 @@ class CoughDatasetCleaned(Dataset):
             elif self.loss == 'cross_entropy_resnet':
                 if self.fusion_type == "none":
                     image = self.pad(self.standardize(self.repeat(image_raw)))
-                    # Apply augmentation (only during training is controlled by dataloader shuffle/drop, but we apply unconditionally)
-                    # The dataset itself does not know if it's training; we rely on the caller to set augmentation only for train folds.
                     if self.augmentation != "none":
                         image = apply_augmentation(image, self.augmentation)
                     return image, label
@@ -491,6 +488,42 @@ def get_early_fusion_data(dataset, data_folds, i, j, cough_dir, speech_dir,
     def collate(batch):
         images, labels, pids = zip(*batch)
         return torch.stack(images), torch.tensor(labels, dtype=torch.long), list(pids)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=4, drop_last=True, collate_fn=collate)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=4, drop_last=False, collate_fn=collate) if val_ds else None
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=4, drop_last=False, collate_fn=collate) if test_ds else None
+    return train_loader, val_loader, test_loader
+
+
+def get_late_fusion_data(dataset, data_folds, i, j, cough_dir, speech_dir,
+                         loss, batch_size, num_outer_folds=10, augmentation="none"):
+    """
+    Returns DataLoaders for late fusion (feature-level fusion).
+    Each sample is a tuple (cough_img, speech_img, label, patient_id).
+    Uses IntermediateFusionDataset which returns two streams.
+    """
+    train_folds_noext = [data_folds + f"/fold_{k}" for k in range(num_outer_folds) if k != j and k != i]
+    train_folds_csv = [f + ".csv" for f in train_folds_noext]
+    dev_file = data_folds + f"/fold_{j}.csv"
+    test_file = data_folds + f"/fold_{i}.csv"
+
+    cough_mean, cough_std = get_mean_std(train_folds_noext, dataset, cough_dir, 128)
+    speech_mean, speech_std = get_speech_mean_std(train_folds_noext, dataset, speech_dir, 128)
+
+    train_ds = ConcatDataset([
+        IntermediateFusionDataset(f, cough_dir, speech_dir, cough_mean, cough_std,
+                                  speech_mean, speech_std, is_train=True, augmentation=augmentation)
+        for f in train_folds_csv
+    ])
+    val_ds = IntermediateFusionDataset(dev_file, cough_dir, speech_dir, cough_mean, cough_std,
+                                       speech_mean, speech_std, is_train=False, augmentation=augmentation) if j is not None else None
+    test_ds = IntermediateFusionDataset(test_file, cough_dir, speech_dir, cough_mean, cough_std,
+                                        speech_mean, speech_std, is_train=False, augmentation=augmentation) if i is not None else None
+
+    def collate(batch):
+        # batch is list of tuples (stream1, stream2, label, pid)
+        stream1, stream2, labels, pids = zip(*batch)
+        return torch.stack(stream1), torch.stack(stream2), torch.tensor(labels, dtype=torch.long), list(pids)
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=4, drop_last=True, collate_fn=collate)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=4, drop_last=False, collate_fn=collate) if val_ds else None

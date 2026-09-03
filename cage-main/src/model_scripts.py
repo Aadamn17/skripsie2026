@@ -15,7 +15,7 @@ class Logistic_Regression(nn.Module):
     def forward(self, x):
         return self.linear(x)
 
-# ResNet18 class (original, no dropout)
+# ResNet18 class (original)
 class ResNet18(nn.Module):
     def __init__(self, num_classes=2):
         super(ResNet18, self).__init__()
@@ -23,6 +23,19 @@ class ResNet18(nn.Module):
         self.resnet.fc = nn.Linear(512, num_classes)
     def forward(self, x):
         return self.resnet(x)
+
+#LateFusion
+class LateFusion(nn.Module):
+    def __init__(self,num_classes=2):
+        super(LateFusion,self).__init__()
+        self.cough_model = ResNet18(num_classes=num_classes)
+        self.speech_model = Logistic_Regression(input_dim=128,num_classes=num_classes)
+        self.fc = nn.Linear(2*num_classes,num_classes)
+    def forward(self,cough_input,speech_input):
+        cough_output = self.cough_model(cough_input)
+        speech_output = self.speech_model(speech_input)
+        combined = torch.cat((cough_output,speech_output),dim=1)
+        return self.fc(combined)    
 
 def train_validate(train_data, dev_data, test_data, model, params):
     """
@@ -66,7 +79,7 @@ def train_epoch(train_data, model, optimizer, criterion):
         input_data = input_data.to(torch.float32).to(device)
         output = model(input_data).to(device)
 
-        # Original loss calculation (as you had it)
+        # Original loss calculation 
         loss = criterion(output[:,1], labels.to(torch.float))
 
         cumulative_loss += loss.item()
@@ -117,9 +130,10 @@ def evaluate_epoch(dev_data, model, criterion):
                         patient_probs[str(i)] = []
                         patient_labels[str(i)] = labels[i].item()
                     patient_probs[str(i)].append(prob[i].item())
-
-            # Original loss calculation
-            loss = criterion(output[:,1], labels.to(torch.float))
+            class_counts = torch.bincount(labels)
+            class_weights = 1.0/class_counts.float()
+            criterion = torch.nn.CrossEntropyLoss(weight=class_weights) # apply class weighting to reduce overconfidence
+            loss = criterion(output, labels)   # labels are LongTensor: [0, 1, 0, 1, ...]
             cumulative_loss += loss.item()
             total_samples += input_data.size(0)
 

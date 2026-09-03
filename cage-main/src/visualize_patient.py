@@ -1,132 +1,138 @@
+#!/usr/bin/env python3
 """
-visualize_patient.py
---------------------
-Loads a random patient from a chosen fold, displays their spectrograms,
-and shows the pooled feature vector that the model uses.
-Saves plots as PNG files instead of showing windows.
+Visualise raw spectrograms (128 bins) for a random patient, standardised to 50 time frames.
+
+Usage:
+    python visualize_patient.py                    # random patient from fold_0.csv
+    python visualize_patient.py --patient_id 123
+    python visualize_patient.py --csv data/cage/data_folds_filtered/fold_1.csv
 """
 
 import os
 import random
+import argparse
 import numpy as np
-import matplotlib
-matplotlib.use('Agg')  # Non-interactive backend (works everywhere)
+import pandas as pd
 import matplotlib.pyplot as plt
-import torch
-import torch.nn.functional as F
 
-from dataloader import PatientEarlyImageDataset, get_mean_std_cough, get_mean_std_speech
-from model_scripts import PatientEarlyImageClassifier, SelfAttentionPool
+# ----------------------------------------------------------------------
+# CONFIGURATION – adjust these to match your dataset
+# ----------------------------------------------------------------------
+COUGH_DIR = "data/cage/mel_spectrograms_128"
+SPEECH_DIR = "data/cage/mel_spectrograms_counting_128"
+DEFAULT_CSV = "data/cage/data_folds_filtered/fold_0.csv"
+TARGET_TIME_FRAMES = 43
 
-# ----------------- CONFIGURATION -----------------
-DATASET = "cage"
-FOLD = 0                      # Choose fold (0–9)
-DATA_FOLDS = f"data/{DATASET}/data_folds_filtered"
-COUGH_DIR = f"data/{DATASET}/mel_spectrograms_128"
-SPEECH_DIR = f"data/{DATASET}/mel_spectrograms_counting_128"
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-# ---------------------------------------------------
+# ----------------------------------------------------------------------
+# Helper functions
+# ----------------------------------------------------------------------
+def get_all_patient_ids(csv_file):
+    df = pd.read_csv(csv_file)
+    patient_ids = df['Cough_ID'].astype(str).apply(lambda x: x.split('/')[0]).unique().tolist()
+    return patient_ids
 
-# 1. Compute mean/std from the training folds
-train_folds = [f"data/{DATASET}/data_folds_filtered/fold_{k}" for k in range(10) if k != FOLD]
-c_mean, c_std = get_mean_std_cough(train_folds, DATASET, COUGH_DIR)
-s_mean, s_std = get_mean_std_speech(train_folds, DATASET, SPEECH_DIR)
+def find_cough_files(patient_id, cough_dir, csv_file):
+    df = pd.read_csv(csv_file)
+    patient_coughs = df[df['Cough_ID'].astype(str).str.startswith(f"{patient_id}/")]
+    paths = []
+    for _, row in patient_coughs.iterrows():
+        cough_id = str(row['Cough_ID'])
+        full_path = os.path.join(cough_dir, cough_id + ".npy")
+        if os.path.exists(full_path):
+            paths.append(full_path)
+    return paths
 
-# 2. Load the patient dataset for the chosen fold
-dataset = PatientEarlyImageDataset(
-    annotations_file=f"{DATA_FOLDS}/fold_{FOLD}.csv",
-    cough_dir=COUGH_DIR,
-    speech_dir=SPEECH_DIR,
-    cough_mean=c_mean,
-    cough_std=c_std,
-    speech_mean=s_mean,
-    speech_std=s_std,
-    is_train=False  # no augmentation
-)
+def find_speech_files(patient_id, speech_dir):
+    patient_folder = os.path.join(speech_dir, str(patient_id))
+    if not os.path.isdir(patient_folder):
+        return []
+    files = [os.path.join(patient_folder, f) for f in os.listdir(patient_folder) if f.endswith('.npy')]
+    return files
 
-# 3. Pick a random patient
-idx = random.randint(0, len(dataset) - 1)
-fused_images, label = dataset[idx]
-patient_id = dataset.patients.iloc[idx]['patient_id']
-print(f"Random patient: {patient_id}, label: {label} (0=negative, 1=positive)")
+def load_spectrogram(path):
+    """
+    Load a .npy spectrogram.
+    Saved as (freq_bins, time_frames) – no transpose needed.
+    """
+    data = np.load(path)
+    return data   # shape (128, T)
 
-# 4. Initialize the model and extract features
-model = PatientEarlyImageClassifier(num_classes=2, freeze_backbone=True).to(DEVICE)
-model.eval()
+def standardise_time_axis(spec, target_frames):
+    """
+    Pad or truncate the time axis (second dimension) to exactly target_frames.
+    """
+    current_frames = spec.shape[1]
+    if current_frames < target_frames:
+        pad_width = ((0, 0), (0, target_frames - current_frames))
+        spec = np.pad(spec, pad_width=pad_width, constant_values=0)
+    elif current_frames > target_frames:
+        spec = spec[:, :target_frames]
+    return spec
 
-features = []
-with torch.no_grad():
-    for fused_img in fused_images:
-        img = fused_img.to(DEVICE).float().unsqueeze(0)
-        feat = model.pool(model.backbone(img)).flatten(1)
-        features.append(feat.cpu().numpy().flatten())
+def plot_spectrograms(cough_spec, speech_spec, patient_id):
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    
+    im1 = ax1.imshow(cough_spec, aspect='auto', origin='lower', cmap='viridis')
+    ax1.set_title(f"Patient {patient_id} – Cough\nShape {cough_spec.shape}")
+    ax1.set_xlabel(f"Time frames (standardised to {TARGET_TIME_FRAMES})")
+    ax1.set_ylabel("Mel frequency bins (0–127)")
+    plt.colorbar(im1, ax=ax1, label="Log magnitude")
+    
+    im2 = ax2.imshow(speech_spec, aspect='auto', origin='lower', cmap='viridis')
+    ax2.set_title(f"Patient {patient_id} – Speech (Counting)\nShape {speech_spec.shape}")
+    ax2.set_xlabel(f"Time frames (standardised to {TARGET_TIME_FRAMES})")
+    ax2.set_ylabel("Mel frequency bins (0–127)")
+    plt.colorbar(im2, ax=ax2, label="Log magnitude")
+    
+    plt.tight_layout()
+    plt.show()
 
-# 5. Save the fused 3‑channel image
-first_pair = fused_images[0]
-c_img = first_pair[0].cpu().numpy()
-s_img = first_pair[1].cpu().numpy()
-avg_img = first_pair[2].cpu().numpy()
+# ----------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------
+def main():
+    global TARGET_TIME_FRAMES   # Must be first
 
-fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-axes[0].imshow(c_img, aspect='auto', origin='lower', cmap='viridis')
-axes[0].set_title("Cough spectrogram")
-axes[0].set_xlabel("Time frames")
-axes[0].set_ylabel("Frequency bins")
-axes[1].imshow(s_img, aspect='auto', origin='lower', cmap='viridis')
-axes[1].set_title("Speech spectrogram")
-axes[1].set_xlabel("Time frames")
-axes[1].set_ylabel("Frequency bins")
-axes[2].imshow(avg_img, aspect='auto', origin='lower', cmap='viridis')
-axes[2].set_title("Average (channel 2)")
-axes[2].set_xlabel("Time frames")
-axes[2].set_ylabel("Frequency bins")
-plt.tight_layout()
-plt.savefig(f"patient_{patient_id}_fused.png", dpi=150)
-plt.close(fig)
-print(f"Saved: patient_{patient_id}_fused.png")
+    parser = argparse.ArgumentParser(description="Visualise raw cough/speech spectrograms (128 bins, standardised to 50 time frames) for a patient.")
+    parser.add_argument('--patient_id', type=str, help="Patient ID")
+    parser.add_argument('--csv', type=str, default=DEFAULT_CSV)
+    parser.add_argument('--cough_idx', type=int, default=0)
+    parser.add_argument('--speech_idx', type=int, default=0)
+    parser.add_argument('--time_frames', type=int, default=TARGET_TIME_FRAMES)
+    args = parser.parse_args()
 
-# 6. Save the pooled feature vector
-pooled_feat = np.mean(features, axis=0)
+    TARGET_TIME_FRAMES = args.time_frames
 
-fig, ax = plt.subplots(figsize=(12, 4))
-ax.bar(range(len(pooled_feat)), pooled_feat, width=1.0)
-ax.set_title(f"Pooled feature vector (512‑dim) for {patient_id}")
-ax.set_xlabel("Feature index")
-ax.set_ylabel("Value")
-plt.tight_layout()
-plt.savefig(f"patient_{patient_id}_features.png", dpi=150)
-plt.close(fig)
-print(f"Saved: patient_{patient_id}_features.png")
+    if args.patient_id is None:
+        all_patients = get_all_patient_ids(args.csv)
+        if not all_patients:
+            print(f"Error: No patients found in {args.csv}")
+            return
+        args.patient_id = random.choice(all_patients)
+        print(f"No patient_id provided. Using random patient: {args.patient_id}")
 
-# 7. Save raw spectrograms (if available)
-patient_row = dataset.patients.iloc[idx]
-cough_ids = patient_row['Cough_ID']
-speech_ids = [f.replace('.npy', '') for f in os.listdir(os.path.join(SPEECH_DIR, patient_id)) if f.endswith('.npy')]
+    cough_files = find_cough_files(args.patient_id, COUGH_DIR, args.csv)
+    speech_files = find_speech_files(args.patient_id, SPEECH_DIR)
 
-if len(cough_ids) > 1:
-    random.shuffle(cough_ids)
-if len(speech_ids) > 1:
-    random.shuffle(speech_ids)
+    if not cough_files:
+        print(f"Error: No cough files found for patient {args.patient_id}")
+        return
+    if not speech_files:
+        print(f"Error: No speech files found for patient {args.patient_id}")
+        return
 
-n_pairs = min(len(cough_ids), len(speech_ids))
-if n_pairs > 0:
-    c_path = os.path.join(COUGH_DIR, str(cough_ids[0]) + ".npy")
-    s_path = os.path.join(SPEECH_DIR, patient_id, speech_ids[0] + ".npy")
-    if os.path.exists(c_path) and os.path.exists(s_path):
-        raw_c = np.load(c_path)
-        raw_s = np.load(s_path)
-        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-        axes[0].imshow(raw_c, aspect='auto', origin='lower', cmap='viridis')
-        axes[0].set_title(f"Raw cough {cough_ids[0]}")
-        axes[0].set_xlabel("Time frames")
-        axes[0].set_ylabel("Frequency bins")
-        axes[1].imshow(raw_s, aspect='auto', origin='lower', cmap='viridis')
-        axes[1].set_title(f"Raw speech {speech_ids[0]}")
-        axes[1].set_xlabel("Time frames")
-        axes[1].set_ylabel("Frequency bins")
-        plt.tight_layout()
-        plt.savefig(f"patient_{patient_id}_raw.png", dpi=150)
-        plt.close(fig)
-        print(f"Saved: patient_{patient_id}_raw.png")
+    cough_spec_raw = load_spectrogram(cough_files[args.cough_idx])
+    speech_spec_raw = load_spectrogram(speech_files[args.speech_idx])
 
-print("Visualization complete. Check the PNG files in the current directory.")
+    cough_spec = standardise_time_axis(cough_spec_raw, TARGET_TIME_FRAMES)
+    speech_spec = standardise_time_axis(speech_spec_raw, TARGET_TIME_FRAMES)
+
+    print(f"Loaded cough: {os.path.basename(cough_files[args.cough_idx])} "
+          f"original {cough_spec_raw.shape} → {cough_spec.shape}")
+    print(f"Loaded speech: {os.path.basename(speech_files[args.speech_idx])} "
+          f"original {speech_spec_raw.shape} → {speech_spec.shape}")
+
+    plot_spectrograms(cough_spec, speech_spec, args.patient_id)
+
+if __name__ == "__main__":
+    main()

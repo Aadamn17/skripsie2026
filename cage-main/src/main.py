@@ -15,7 +15,7 @@ grid = {
     'dataset': ["cage"],
     'arch': ["resnet"],
     'fusion': ["early"],   # "early" or "late" or "none"
-    'augmentation': ["none", "gaussian_noise", "solarisation", "frequency_masking", "time_masking"]
+    'augmentation': ["gaussian_noise"] #"gaussian_noise", "solarisation", "frequency_masking", "time_masking"
 }
 
 cough_dir = "data/cage/mel_spectrograms_128"
@@ -50,7 +50,7 @@ def main(grid):
         elif point['fusion'] == "none":
             train, val, test = get_data(
                 dataset=point['dataset'],
-                data_folds="data/"+point['dataset']+"/data_folds_filtered",   # fixed missing slash
+                data_folds="data/"+point['dataset']+"/data_folds_filtered",   
                 i=point['test_set'], j=point['dev_set'],
                 cough_dir=cough_dir,
                 loss=point['loss_selected'],
@@ -59,6 +59,19 @@ def main(grid):
                 augmentation=point['augmentation']
             )
             model = ResNet18(num_classes=2).to(device)
+
+        elif ['fusion'] == 'late':
+            train, val, test = get_late_fusion_data(
+                dataset=point['cage'],
+                data_folds = "data/"+point['dataset']+"data_folds_filtered",
+                i=point['test_set'],j=point['dev_set'],
+                cough_dir=cough_dir,speech_dir=speech_dir,
+                loss = point['loss_selected'],batch_size = point['batch_size'],
+                num_outer_folds=10,
+                augmentation = point['augmentation']
+
+            )
+            #model = LateFusion
 
         else:
             raise ValueError(f"Unknown fusion: {point['fusion']}")
