@@ -3,6 +3,8 @@ import random
 import torch
 from dataloader import *
 from model_scripts import train_validate, ResNet18
+import torchvision
+from torchvision.models import ResNet18_Weights
 
 grid = {
     'loss_selected': ["cross_entropy_resnet"],
@@ -45,7 +47,7 @@ def main(grid):
                 num_outer_folds=10,
                 augmentation=point['augmentation']
             )
-            model = ResNet18(num_classes=2).to(device)
+            model = ResNet18(num_classes=2,weights = ResNet18_Weights.IMAGENET1K_V1).to(device)
 
         elif point['fusion'] == "none":
             train, val, test = get_data(

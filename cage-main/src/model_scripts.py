@@ -17,10 +17,13 @@ class Logistic_Regression(nn.Module):
 
 # ResNet18 class (original)
 class ResNet18(nn.Module):
-    def __init__(self, num_classes=2):
+    def __init__(self, num_classes=2,pretrained=True):
         super(ResNet18, self).__init__()
         self.resnet = resnet18()
         self.resnet.fc = nn.Linear(512, num_classes)
+
+        for parmams in self.resnet.parameters():
+            parmams.requires_grad = False
     def forward(self, x):
         return self.resnet(x)
 
