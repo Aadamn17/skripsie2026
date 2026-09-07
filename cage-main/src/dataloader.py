@@ -456,7 +456,15 @@ class LateFusionDataset(Dataset):
         # Load and process cough
         c_raw = torch.tensor(np.transpose(np.load(os.path.join(self.cough_dir, cid + ".npy"))))
         c_norm = (c_raw - self.cough_mean) / self.cough_std
-        c_img = self._pad_to_224(c_norm)          # (224,224)
+        c_augmented = apply_augmentation(c_norm, self.augmentation) if self.is_train and self.augmentation != "none" else c_norm
+        c_img = self._pad_to_224(c_augmented)          # (224,224)
+
+        #standardize cough image for resnet18
+        c_img = TF.normalize(
+            c_img, 
+            mean=[0.485, 0.456, 0.406], 
+            std=[0.229, 0.224, 0.225]
+        )
 
         # Mean speech for this patient
         s_img = self._mean_speech_image(pid)      # (224,224)
@@ -467,10 +475,6 @@ class LateFusionDataset(Dataset):
         # Stream 2: single-channel speech (1,224,224)
         stream2 = s_img.unsqueeze(0)                   # (1,224,224)
 
-        # Apply augmentation if training
-        if self.is_train and self.augmentation != "none":
-            stream1 = apply_augmentation(stream1, self.augmentation)
-            stream2 = apply_augmentation(stream2, self.augmentation)
 
         return stream1, stream2, label, pid
 
@@ -518,7 +522,7 @@ def get_late_fusion_data(dataset, data_folds, i, j, cough_dir, speech_dir,
     """
     Returns DataLoaders for late fusion (feature-level fusion).
     Each sample is a tuple (cough_img, speech_img, label, patient_id).
-    Uses IntermediateFusionDataset which returns two streams.
+    Uses LateFusionDataset which returns two streams.
     """
     train_folds_noext = [data_folds + f"/fold_{k}" for k in range(num_outer_folds) if k != j and k != i]
     train_folds_csv = [f + ".csv" for f in train_folds_noext]
@@ -529,13 +533,13 @@ def get_late_fusion_data(dataset, data_folds, i, j, cough_dir, speech_dir,
     speech_mean, speech_std = get_speech_mean_std(train_folds_noext, dataset, speech_dir, 128)
 
     train_ds = ConcatDataset([
-        IntermediateFusionDataset(f, cough_dir, speech_dir, cough_mean, cough_std,
-                                  speech_mean, speech_std, is_train=True, augmentation=augmentation)
+        LateFusionDataset(f, cough_dir, speech_dir, cough_mean, cough_std,
+                           speech_mean, speech_std, is_train=True, augmentation=augmentation)
         for f in train_folds_csv
     ])
-    val_ds = IntermediateFusionDataset(dev_file, cough_dir, speech_dir, cough_mean, cough_std,
-                                       speech_mean, speech_std, is_train=False, augmentation=augmentation) if j is not None else None
-    test_ds = IntermediateFusionDataset(test_file, cough_dir, speech_dir, cough_mean, cough_std,
+    val_ds = LateFusionDataset(dev_file, cough_dir, speech_dir, cough_mean, cough_std,
+                                speech_mean, speech_std, is_train=False, augmentation=augmentation) if j is not None else None
+    test_ds = LateFusionDataset(test_file, cough_dir, speech_dir, cough_mean, cough_std,
                                         speech_mean, speech_std, is_train=False, augmentation=augmentation) if i is not None else None
 
     def collate(batch):
