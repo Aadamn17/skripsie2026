@@ -3,7 +3,7 @@ import torch
 import numpy as np
 from sklearn import metrics
 import torch.nn as nn
-from torchvision.models import resnet18
+from torchvision.models import resnet18, ResNet18_Weights
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -15,15 +15,15 @@ class Logistic_Regression(nn.Module):
     def forward(self, x):
         return self.linear(x)
 
-# ResNet18 class (original)
+# ResNet18 class ->Trying wth frozen backbone and pretrained weights
 class ResNet18(nn.Module):
-    def __init__(self, num_classes=2,pretrained=True):
+    def __init__(self, num_classes=2,weights = ResNet18_Weights.IMAGENET1K_V1):
         super(ResNet18, self).__init__()
-        self.resnet = resnet18()
+        self.resnet = resnet18(weights=weights)
         self.resnet.fc = nn.Linear(512, num_classes)
 
         for parmams in self.resnet.parameters():
-            parmams.requires_grad = False
+            parmams.requires_grad = True # True unfreezes the backbone and allows it to be trained. False freezes the backbone and only trains the final layer
     def forward(self, x):
         return self.resnet(x)
 
@@ -47,7 +47,24 @@ def train_validate(train_data, dev_data, test_data, model, params):
     """
     optimizer = torch.optim.AdamW(model.parameters(), lr=params["learning_rate"],
                                   weight_decay=params['weight_decay'])
-    criterion = torch.nn.CrossEntropyLoss()
+    train_labels = []
+
+    for batch in train_data:
+        # Current early-fusion batches are (inputs, labels, patient_ids)
+        if len(batch) == 4:  # late fusion: input1, input2, labels, patient_ids
+            labels = batch[2]
+        else:
+            labels = batch[1] # early fusion: inputs, labels, patient_ids
+
+        train_labels.append(labels)
+
+    train_labels = torch.cat(train_labels).long()
+    class_counts = torch.bincount(train_labels, minlength=2)
+
+    weights = class_counts.sum() / (2 * class_counts.float())
+    weights = weights.to(device)
+
+    criterion = torch.nn.CrossEntropyLoss(weight=weights)
 
     dev_acc, dev_auc, test_acc, test_auc = 0, 0, 0, 0
     for epoch in range(params["num_epochs"]):
@@ -82,10 +99,10 @@ def train_epoch(train_data, model, optimizer, criterion):
         input_data = input_data.to(torch.float32).to(device)
         output = model(input_data).to(device)
 
-        # Original loss calculation 
-        loss = criterion(output[:,1], labels.to(torch.float))
+        #loss calculation 
+        loss = criterion(output, labels.long())
 
-        cumulative_loss += loss.item()
+        cumulative_loss += loss.item() * input_data.size(0)
         total_samples += input_data.size(0)
 
         loss.backward()
@@ -98,7 +115,6 @@ def evaluate_epoch(dev_data, model, criterion):
     """
     Evaluation with patient-level aggregation.
     Each batch is (input_data, labels, pids) or (input_data, labels).
-    Loss is computed exactly as the original: criterion(output[:,1], labels.float()).
     """
     model.eval()
     cumulative_loss, total_samples = 0, 0
@@ -133,11 +149,8 @@ def evaluate_epoch(dev_data, model, criterion):
                         patient_probs[str(i)] = []
                         patient_labels[str(i)] = labels[i].item()
                     patient_probs[str(i)].append(prob[i].item())
-            class_counts = torch.bincount(labels)
-            class_weights = 1.0/class_counts.float()
-            criterion = torch.nn.CrossEntropyLoss(weight=class_weights) # apply class weighting to reduce overconfidence
-            loss = criterion(output, labels)   # labels are LongTensor: [0, 1, 0, 1, ...]
-            cumulative_loss += loss.item()
+            loss = criterion(output, labels.long())   # labels are LongTensor: [0, 1, 0, 1, ...]
+            cumulative_loss += loss.item() * input_data.size(0)
             total_samples += input_data.size(0)
 
     # Aggregate per patient (or per sample if no patient IDs)
@@ -156,4 +169,7 @@ def evaluate_epoch(dev_data, model, criterion):
     auc = metrics.auc(fpr, tpr)
 
     cumulative_loss = cumulative_loss / total_samples
+    print("Predicted class counts:", torch.bincount(predictions.long(), minlength=2))
+    print("Actual class counts:", torch.bincount(agg_labels.long(), minlength=2))
+    print("Accuracy:", acc.item())
     return cumulative_loss, acc, auc

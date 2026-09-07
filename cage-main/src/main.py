@@ -2,8 +2,9 @@ import itertools
 import random
 import torch
 from dataloader import *
-from model_scripts import train_validate, ResNet18
-import torchvision
+from model_scripts import *
+import torchvision 
+from torchvision import models
 from torchvision.models import ResNet18_Weights
 
 grid = {
@@ -12,7 +13,7 @@ grid = {
     'dev_set': [0,1,2,3,4,5,6,7,8,9],
     'num_epochs': [32],
     'batch_size': [32],
-    'learning_rate': [1e-4],
+    'learning_rate': [1e-5],
     'weight_decay': [1e-4],
     'dataset': ["cage"],
     'arch': ["resnet"],
@@ -65,7 +66,7 @@ def main(grid):
         elif ['fusion'] == 'late':
             train, val, test = get_late_fusion_data(
                 dataset=point['cage'],
-                data_folds = "data/"+point['dataset']+"data_folds_filtered",
+                data_folds = "data/"+point['dataset']+"/data_folds_filtered",
                 i=point['test_set'],j=point['dev_set'],
                 cough_dir=cough_dir,speech_dir=speech_dir,
                 loss = point['loss_selected'],batch_size = point['batch_size'],
@@ -73,7 +74,7 @@ def main(grid):
                 augmentation = point['augmentation']
 
             )
-            #model = LateFusion
+            model = LateFusion(num_classes=2).to(device)
 
         else:
             raise ValueError(f"Unknown fusion: {point['fusion']}")

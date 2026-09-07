@@ -1,10 +1,12 @@
 import os
 import torch
+from torch import torchvision
 import numpy as np
 import pandas as pd
 from scipy.io import wavfile
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from PIL import ImageOps
+import torchvision.transforms.functional as TF
 
 # ======================================================================
 # AUGMENTATION FUNCTIONS
@@ -313,6 +315,7 @@ class EarlyFusionFlatDataset(Dataset):
         self.speech_std = speech_std
         self.is_train = is_train
         self.augmentation = augmentation
+        self.speech_cache = {}  
 
     def __len__(self):
         return len(self.samples)
@@ -331,24 +334,31 @@ class EarlyFusionFlatDataset(Dataset):
         return img[0]  # (224,224)
 
     def _mean_speech_image(self, pid):
-        folder = os.path.join(self.speech_dir, pid)
-        imgs = []
-        for fname in os.listdir(folder):
-            if fname.endswith('.npy'):
-                raw = torch.tensor(np.transpose(np.load(os.path.join(folder, fname))))
-                norm = (raw - self.speech_mean) / self.speech_std
-                imgs.append(self._pad_to_224(norm))
-        if imgs:
-            return torch.stack(imgs).mean(0)   # (224,224)
-        else:
-            return torch.zeros(224,224)
+            if pid in self.speech_cache:
+                return self.speech_cache[pid]
 
+            folder = os.path.join(self.speech_dir, pid)
+            imgs = []
+            for fname in os.listdir(folder):
+                if fname.endswith('.npy'):
+                    raw = torch.tensor(np.transpose(np.load(os.path.join(folder, fname))))
+                    norm = (raw - self.speech_mean) / self.speech_std
+                    imgs.append(self._pad_to_224(norm))
+            
+            if imgs:
+                mean_img = torch.stack(imgs).mean(0)   # (224, 224)
+            else:
+                mean_img = torch.zeros(224, 224)
+
+            self.speech_cache[pid] = mean_img
+            return mean_img
     def __getitem__(self, idx):
         cid, pid, label = self.samples[idx]
         # Load and process cough
         c_raw = torch.tensor(np.transpose(np.load(os.path.join(self.cough_dir, cid + ".npy"))))
         c_norm = (c_raw - self.cough_mean) / self.cough_std
-        c_img = self._pad_to_224(c_norm)   # (224,224)
+        c_augmented = apply_augmentation(c_norm, self.augmentation) if self.is_train and self.augmentation != "none" else c_norm
+        c_img = self._pad_to_224(c_augmented)   # (224,224) ->For resnet18
 
         # Mean speech for this patient
         m_speech = self._mean_speech_image(pid)   # (224,224)
@@ -356,17 +366,25 @@ class EarlyFusionFlatDataset(Dataset):
         # Build 3 channels
         ch1 = c_img.unsqueeze(0)        # (1,224,224)
         ch2 = m_speech.unsqueeze(0)     # (1,224,224)
-        ch3 = ch1 * ch2                 # product
+        ch3 = torch.abs(ch1-ch2)                #absolute spectral difference (1,224,224)
         fused = torch.cat([ch1, ch2, ch3], dim=0)  # (3,224,224)
 
-        # Apply augmentation if training
-        if self.is_train and self.augmentation != "none":
-            fused = apply_augmentation(fused, self.augmentation)
+        
+        f_min, f_max = fused.min(), fused.max()
+        if f_max > f_min:
+            fused = (fused - f_min) / (f_max - f_min)
+
+        # 6. Apply ImageNet Channel Normalization
+        fused = TF.normalize(
+            fused, 
+            mean=[0.485, 0.456, 0.406], 
+            std=[0.229, 0.224, 0.225]
+        )
 
         return fused, label, pid
 
 
-class IntermediateFusionDataset(Dataset):
+class LateFusionDataset(Dataset):
     """
     For each patient, compute the mean speech image (over all speech recordings).
     Stream 1: coughx3 (standardized, padded to 224x224), giving 3x224x224,
