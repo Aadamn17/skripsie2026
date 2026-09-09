@@ -13,11 +13,11 @@ grid = {
     'dev_set': [0,1,2,3,4,5,6,7,8,9],
     'num_epochs': [32],
     'batch_size': [32],
-    'learning_rate': [1e-5],
+    'learning_rate': [5e-5],
     'weight_decay': [1e-4],
     'dataset': ["cage"],
-    'arch': ["resnet"],
-    'fusion': ["early"],   # "early" or "late" or "none"
+    'arch': ["resnet"],	#resnet or lr ->logistic regression
+    'fusion': ["late"],   # "early" or "late" or "none"
     'augmentation': ["gaussian_noise"] #"gaussian_noise", "solarisation", "frequency_masking", "time_masking"
 }
 
@@ -63,18 +63,17 @@ def main(grid):
             )
             model = ResNet18(num_classes=2).to(device)
 
-        elif ['fusion'] == 'late':
+        elif point['fusion'] == 'late':
             train, val, test = get_late_fusion_data(
-                dataset=point['cage'],
+                dataset=point['dataset'],
                 data_folds = "data/"+point['dataset']+"/data_folds_filtered",
                 i=point['test_set'],j=point['dev_set'],
                 cough_dir=cough_dir,speech_dir=speech_dir,
-                loss = point['loss_selected'],batch_size = point['batch_size'],
-                num_outer_folds=10,
-                augmentation = point['augmentation']
-
+                loss = point['loss_selected'],batch_size = point['batch_size'],num_outer_folds=10,
+                augmentation = point['augmentation'],
+                speech_arch = point['arch']
             )
-            model = LateFusion(num_classes=2).to(device)
+            model = LateFusion(speech_encoding_method=point['arch'],num_classes=2).to(device)
 
         else:
             raise ValueError(f"Unknown fusion: {point['fusion']}")

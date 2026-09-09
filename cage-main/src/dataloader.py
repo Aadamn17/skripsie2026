@@ -1,6 +1,5 @@
 import os
 import torch
-from torch import torchvision
 import numpy as np
 import pandas as pd
 from scipy.io import wavfile
@@ -392,8 +391,7 @@ class LateFusionDataset(Dataset):
     Returns (cough_img, speech_img, label, patient_id).
     """
     def __init__(self, annotations_file, cough_dir, speech_dir,
-                 cough_mean, cough_std, speech_mean, speech_std,
-                 is_train=False, augmentation="none"):
+                 cough_mean, cough_std, speech_mean, speech_std,speech_arch,is_train=False, augmentation="none"):
         self.df = pd.read_csv(annotations_file)
         self.df['patient_id'] = self.df['Cough_ID'].astype(str).apply(lambda x: x.split('/')[0])
         self.df = self.df[self.df['Cough_ID'].astype(str).map(
@@ -419,6 +417,7 @@ class LateFusionDataset(Dataset):
         self.speech_std = speech_std
         self.is_train = is_train
         self.augmentation = augmentation
+        self.speech_arch = speech_arch
 
     def __len__(self):
         return len(self.samples)
@@ -446,6 +445,7 @@ class LateFusionDataset(Dataset):
                 padded = self._pad_to_224(norm)
                 imgs.append(padded)
         if imgs:
+            
             return torch.stack(imgs).mean(0)   # (224,224)
         else:
             return torch.zeros(224,224)
@@ -460,8 +460,9 @@ class LateFusionDataset(Dataset):
         c_img = self._pad_to_224(c_augmented)          # (224,224)
 
         #standardize cough image for resnet18
-        c_img = TF.normalize(
-            c_img, 
+        stream1 = c_img.unsqueeze(0).repeat(3, 1, 1) 
+        stream1 = TF.normalize(
+            stream1, 
             mean=[0.485, 0.456, 0.406], 
             std=[0.229, 0.224, 0.225]
         )
@@ -469,12 +470,13 @@ class LateFusionDataset(Dataset):
         # Mean speech for this patient
         s_img = self._mean_speech_image(pid)      # (224,224)
 
-        # Build stream 1: 3-channel cough (repeat single channel)
-        stream1 = c_img.unsqueeze(0).repeat(3, 1, 1)   # (3,224,224)
+        # Build stream 1: 3-channel cough (repeat single channel) # (3,224,224)
 
-        # Stream 2: single-channel speech (1,224,224)
-        stream2 = s_img.unsqueeze(0)                   # (1,224,224)
-
+        # Stream 2: single-channel speech (1,224,224) -> can work for resnet if repeated.
+        if self.speech_arch =="resnet":
+            stream2 = s_img.unsqueeze(0).repeat(3,1,1)
+        elif self.speech_arch == "lr":
+            stream2 = s_img.flatten()                # (1,224,224)
 
         return stream1, stream2, label, pid
 
@@ -518,7 +520,7 @@ def get_early_fusion_data(dataset, data_folds, i, j, cough_dir, speech_dir,
 
 
 def get_late_fusion_data(dataset, data_folds, i, j, cough_dir, speech_dir,
-                         loss, batch_size, num_outer_folds=10, augmentation="none"):
+                         loss, batch_size, num_outer_folds=10, augmentation="none",speech_arch = "none"):
     """
     Returns DataLoaders for late fusion (feature-level fusion).
     Each sample is a tuple (cough_img, speech_img, label, patient_id).
@@ -534,13 +536,13 @@ def get_late_fusion_data(dataset, data_folds, i, j, cough_dir, speech_dir,
 
     train_ds = ConcatDataset([
         LateFusionDataset(f, cough_dir, speech_dir, cough_mean, cough_std,
-                           speech_mean, speech_std, is_train=True, augmentation=augmentation)
+                           speech_mean, speech_std,speech_arch=speech_arch, is_train=True, augmentation=augmentation)
         for f in train_folds_csv
     ])
     val_ds = LateFusionDataset(dev_file, cough_dir, speech_dir, cough_mean, cough_std,
-                                speech_mean, speech_std, is_train=False, augmentation=augmentation) if j is not None else None
+                                speech_mean, speech_std,speech_arch=speech_arch, is_train=False, augmentation=augmentation) if j is not None else None
     test_ds = LateFusionDataset(test_file, cough_dir, speech_dir, cough_mean, cough_std,
-                                        speech_mean, speech_std, is_train=False, augmentation=augmentation) if i is not None else None
+                                        speech_mean, speech_std,speech_arch=speech_arch ,is_train=False, augmentation=augmentation) if i is not None else None
 
     def collate(batch):
         # batch is list of tuples (stream1, stream2, label, pid)
