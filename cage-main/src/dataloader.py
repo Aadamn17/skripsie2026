@@ -453,30 +453,28 @@ class LateFusionDataset(Dataset):
     def __getitem__(self, idx):
         cid, pid, label = self.samples[idx]
 
-        # Load and process cough
+        # Load and pad cough
         c_raw = torch.tensor(np.transpose(np.load(os.path.join(self.cough_dir, cid + ".npy"))))
         c_norm = (c_raw - self.cough_mean) / self.cough_std
         c_augmented = apply_augmentation(c_norm, self.augmentation) if self.is_train and self.augmentation != "none" else c_norm
-        c_img = self._pad_to_224(c_augmented)          # (224,224)
+        c_img = self._pad_to_224(c_augmented)
 
-        #standardize cough image for resnet18
-        stream1 = c_img.unsqueeze(0).repeat(3, 1, 1) 
-        stream1 = TF.normalize(
-            stream1, 
-            mean=[0.485, 0.456, 0.406], 
-            std=[0.229, 0.224, 0.225]
-        )
+        # Convert stream 1 (cough) to [0, 1] range before ImageNet normalization
+        c_min, c_max = c_img.min(), c_img.max()
+        c_scaled = (c_img - c_min) / (c_max - c_min + 1e-8)
+        stream1 = c_scaled.unsqueeze(0).repeat(3, 1, 1)
+        stream1 = TF.normalize(stream1, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
-        # Mean speech for this patient
-        s_img = self._mean_speech_image(pid)      # (224,224)
+        # Load speech
+        s_img = self._mean_speech_image(pid)
 
-        # Build stream 1: 3-channel cough (repeat single channel) # (3,224,224)
-
-        # Stream 2: single-channel speech (1,224,224) -> can work for resnet if repeated.
-        if self.speech_arch =="resnet":
-            stream2 = s_img.unsqueeze(0).repeat(3,1,1)
+        if self.speech_arch == "resnet":
+            s_min, s_max = s_img.min(), s_img.max()
+            s_scaled = (s_img - s_min) / (s_max - s_min + 1e-8)
+            stream2 = s_scaled.unsqueeze(0).repeat(3, 1, 1)
+            stream2 = TF.normalize(stream2, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         elif self.speech_arch == "lr":
-            stream2 = s_img.flatten()                # (1,224,224)
+            stream2 = s_img.unsqueeze(0)  # (1, 224, 224)
 
         return stream1, stream2, label, pid
 

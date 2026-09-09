@@ -27,22 +27,58 @@ class ResNet18(nn.Module):
     def forward(self, x):
         return self.resnet(x)
 
+class ResNet18_encoder(nn.Module):
+    def __init__(self, num_classes=2,weights = ResNet18_Weights.IMAGENET1K_V1):
+        super(ResNet18_encoder, self).__init__()
+        self.resnet = resnet18(weights=weights)
+        #self.resnet.fc = nn.Linear(512, num_classes)
+        for parmams in self.resnet.parameters():
+            parmams.requires_grad = True # True unfreezes the backbone and allows it to be trained. False freezes the backbone and only trains the final layer
+    def forward(self, x):
+        return self.resnet(x)
 #LateFusion
 class LateFusion(nn.Module):
-    def __init__(self,speech_encoding_method,num_classes=2):
-        super(LateFusion,self).__init__()
+    def __init__(self, speech_encoding_method, num_classes=2, dropout_p=0.3):
+        super(LateFusion, self).__init__()
         self.speech_encoding_method = speech_encoding_method
-        self.cough_model = ResNet18(num_classes=num_classes)
+        
+        # Encoders
+        self.cough_model = ResNet18_encoder(num_classes=num_classes)
+        self.cough_model.resnet.fc = nn.Identity()
+        
         if self.speech_encoding_method == "lr":
-            self.speech_model = Logistic_Regression(input_dim = 224*224,num_classes=num_classes)
+            self.speech_model = Logistic_Regression(input_dim=224*224, num_classes=num_classes)
+            in_features = 512 + num_classes
         elif self.speech_encoding_method == "resnet":
-            self.speech_model = ResNet18(num_classes=num_classes)
-        self.fc = nn.Linear(2*num_classes,num_classes)
-    def forward(self,cough_input,speech_input):
+            self.speech_model = ResNet18_encoder(num_classes=num_classes)
+            self.speech_model.resnet.fc = nn.Identity()
+            in_features = 512 + 512
+
+        # 1. Asymmetric Branch Dropout (forces primary dependence on cough)
+        self.cough_dropout = nn.Dropout(p=0.2)
+        self.speech_dropout = nn.Dropout(p=0.5)
+
+        # 2. Multi-Layer Bottleneck Head with Normalization
+        self.classifier = nn.Sequential(
+            nn.BatchNorm1d(in_features),
+            nn.Dropout(p=dropout_p),
+            nn.Linear(in_features, 256),
+            nn.ReLU(),
+            nn.BatchNorm1d(256),
+            nn.Dropout(p=dropout_p),
+            nn.Linear(256, num_classes)
+        )
+
+    def forward(self, cough_input, speech_input):
         cough_output = self.cough_model(cough_input)
         speech_output = self.speech_model(speech_input)
-        combined = torch.cat((cough_output,speech_output),dim=1)
-        return self.fc(combined)    
+        
+        # Apply stream-level regularization before concatenation
+        cough_output = self.cough_dropout(cough_output)
+        speech_output = self.speech_dropout(speech_output)
+        
+        combined = torch.cat((cough_output, speech_output), dim=1)
+        return self.classifier(combined) 
 
 def train_validate(train_data, dev_data, test_data, model, params):
     """
@@ -121,7 +157,7 @@ def train_epoch(train_data, model, optimizer, criterion):
 def evaluate_epoch(dev_data, model, criterion):
     """
     Evaluation with patient-level aggregation.
-    Each batch is (input_data, labels, pids) or (input_data, labels).
+    Supports single-stream inputs (2 or 3 tuple items) and late fusion streams (4 tuple items).
     """
     model.eval()
     cumulative_loss, total_samples = 0, 0
@@ -129,48 +165,63 @@ def evaluate_epoch(dev_data, model, criterion):
     patient_labels = {}
 
     with torch.no_grad():
-        for _, input in enumerate(dev_data):
-            if len(input) == 3:
-                input_data, labels, pids = input
-            else:
-                input_data, labels = input
-                pids = None  # No patient IDs available (use cough-level)
+        for _, batch in enumerate(dev_data):
+            # 1. Unpack batch based on modality stream count
+            if len(batch) == 4:  # Late fusion: (cough_data, speech_data, labels, pids)
+                cough_data, speech_data, labels, pids = batch
+                cough_data = cough_data.to(torch.float32).to(device)
+                speech_data = speech_data.to(torch.float32).to(device)
+                labels = labels.to(device)
+                output = model(cough_data, speech_data)
+                batch_size = cough_data.size(0)
 
-            input_data = input_data.to(torch.float32).to(device)
-            output = model(input_data).to(device)
-            labels = labels.to(device)
+            elif len(batch) == 3:  # Early fusion / Single-stream with PIDs: (input_data, labels, pids)
+                input_data, labels, pids = batch
+                input_data = input_data.to(torch.float32).to(device)
+                labels = labels.to(device)
+                output = model(input_data)
+                batch_size = input_data.size(0)
 
-            prob = torch.nn.functional.softmax(output, dim=1)[:, 1]  # p(positive)
+            else:  # Fallback: (input_data, labels)
+                input_data, labels = batch
+                pids = None
+                input_data = input_data.to(torch.float32).to(device)
+                labels = labels.to(device)
+                output = model(input_data)
+                batch_size = input_data.size(0)
 
+            # 2. Extract positive class probabilities (FIXED LINE HERE)
+            prob = torch.nn.functional.softmax(output, dim=1)[:, 1]
+
+            # 3. Patient-level aggregation tracking
             if pids is not None:
-                # Patient-level aggregation
                 for i, pid in enumerate(pids):
                     if pid not in patient_probs:
                         patient_probs[pid] = []
                         patient_labels[pid] = labels[i].item()
                     patient_probs[pid].append(prob[i].item())
             else:
-                # Fallback to cough-level if no patient IDs
                 for i in range(len(labels)):
-                    if str(i) not in patient_probs:
-                        patient_probs[str(i)] = []
-                        patient_labels[str(i)] = labels[i].item()
-                    patient_probs[str(i)].append(prob[i].item())
-            loss = criterion(output, labels.long())   # labels are LongTensor: [0, 1, 0, 1, ...]
-            cumulative_loss += loss.item() * input_data.size(0)
-            total_samples += input_data.size(0)
+                    sample_key = f"sample_{total_samples + i}"
+                    patient_probs[sample_key] = [prob[i].item()]
+                    patient_labels[sample_key] = labels[i].item()
 
-    # Aggregate per patient (or per sample if no patient IDs)
+            loss = criterion(output, labels.long())
+            cumulative_loss += loss.item() * batch_size
+            total_samples += batch_size
+
+    # 4. Average prediction probabilities across patient recordings
     agg_probs = []
     agg_labels = []
     for pid, probs_list in patient_probs.items():
         agg_probs.append(np.mean(probs_list))
         agg_labels.append(patient_labels[pid])
 
-    # Compute metrics
+    # 5. Compute performance metrics
     agg_probs = torch.tensor(agg_probs)
     agg_labels = torch.tensor(agg_labels)
     predictions = (agg_probs > 0.5).float()
+    
     acc = (predictions == agg_labels).float().mean()
     fpr, tpr, _ = metrics.roc_curve(agg_labels, agg_probs)
     auc = metrics.auc(fpr, tpr)
@@ -179,4 +230,5 @@ def evaluate_epoch(dev_data, model, criterion):
     print("Predicted class counts:", torch.bincount(predictions.long(), minlength=2))
     print("Actual class counts:", torch.bincount(agg_labels.long(), minlength=2))
     print("Accuracy:", acc.item())
-    return cumulative_loss, acc, auc
+    
+    return cumulative_loss, acc.item(), auc
