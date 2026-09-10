@@ -12,17 +12,17 @@ grid = {
     'test_set': [0,1,2,3,4,5,6,7,8,9],
     'dev_set': [0,1,2,3,4,5,6,7,8,9],
     'num_epochs': [32],
-    'batch_size': [32],
-    'learning_rate': [5e-5],
+    'batch_size': [8],
+    'learning_rate': [1e-5],
     'weight_decay': [1e-4],
     'dataset': ["cage"],
     'arch': ["resnet"],	#resnet or lr ->logistic regression
-    'fusion': ["late"],   # "early" or "late" or "none"
+    'fusion': ["early"],   # "early" or "late" or "none"
     'augmentation': ["gaussian_noise"] #"gaussian_noise", "solarisation", "frequency_masking", "time_masking"
 }
 
 cough_dir = "data/cage/mel_spectrograms_128"
-speech_dir = "data/cage/mel_spectrograms_counting_128"
+speech_dir = "data/cage/preprocessed_speech_224"  # per-patient .pt tensors from preprocessdata.py
 log_file = "logs/log.txt"
 
 def main(grid):

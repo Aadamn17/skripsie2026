@@ -80,6 +80,57 @@ class LateFusion(nn.Module):
         combined = torch.cat((cough_output, speech_output), dim=1)
         return self.classifier(combined) 
 
+class Intermediate(nn.Module):
+    def __init__(self,num_classes):
+        super(Intermediate,self).__init__()
+        rensetcough = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+        self.cough_base = nn.Sequential(
+            rensetcough.conv1,
+            resnetcough.bn1,
+            resnetcough.relu,
+            resnetcough.maxpool,
+            resnetcough.layer1,
+            resnetcough.layer2,
+            resnetcough.layer3
+            )
+        resnetspeech = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+        self.speech_base = nn.Sequential(
+            resnetspeech.conv1,
+            resnetspeech.bn1,
+            resnetspeech.relu,
+            resnetspeech.maxpool,
+            resnetspeech.layer1,
+            resnetspeech.layer2,
+            resnetspeech.layer3
+            )
+# Fusion Layer: Compress concatenated 512 channels back to 256
+        self.fusion_conv = nn.Sequential(
+            nn.Conv2d(512, 256, kernel_size=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True)
+        )
+        self.layer4 = resnet_cough.layer4  # Outputs: (Batch, 512, 7, 7)
+        self.avgpool = resnet_cough.avgpool
+        self.fc = nn.Linear(512, num_classes)
+
+    def forward(self, stream1, stream2):
+        # Extract intermediate features
+        c_feat = self.cough_base(stream1)
+        s_feat = self.speech_base(stream2)
+
+        # Fuse via concatenation along the channel dimension (dim=1)
+        fused = torch.cat((c_feat, s_feat), dim=1)  # Shape: (Batch, 512, 14, 14)
+
+        # Blend and reduce channels
+        fused = self.fusion_conv(fused)             # Shape: (Batch, 256, 14, 14)
+
+        # Pass through the final ResNet block and classifier
+        out = self.layer4(fused)
+        out = self.avgpool(out)
+        out = torch.flatten(out, 1)
+        out = self.fc(out)
+
+        return out
 def train_validate(train_data, dev_data, test_data, model, params):
     """
     Training and evaluating logic.
