@@ -83,9 +83,9 @@ class LateFusion(nn.Module):
 class Intermediate(nn.Module):
     def __init__(self,num_classes):
         super(Intermediate,self).__init__()
-        rensetcough = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+        resnetcough = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
         self.cough_base = nn.Sequential(
-            rensetcough.conv1,
+            resnetcough.conv1,
             resnetcough.bn1,
             resnetcough.relu,
             resnetcough.maxpool,
@@ -109,8 +109,8 @@ class Intermediate(nn.Module):
             nn.BatchNorm2d(256),
             nn.ReLU(inplace=True)
         )
-        self.layer4 = resnet_cough.layer4  # Outputs: (Batch, 512, 7, 7)
-        self.avgpool = resnet_cough.avgpool
+        self.layer4 = resnetcough.layer4  # Outputs: (Batch, 512, 7, 7)
+        self.avgpool = resnetcough.avgpool
         self.fc = nn.Linear(512, num_classes)
 
     def forward(self, stream1, stream2):
@@ -141,11 +141,10 @@ def train_validate(train_data, dev_data, test_data, model, params):
     train_labels = []
 
     for batch in train_data:
-        # Current early-fusion batches are (inputs, labels, patient_ids)
-        if len(batch) == 4:  # late fusion: input1, input2, labels, patient_ids
+        if len(batch) == 4:
             labels = batch[2]
         else:
-            labels = batch[1] # early fusion: inputs, labels, patient_ids
+            labels = batch[1]
 
         train_labels.append(labels)
 
@@ -155,17 +154,21 @@ def train_validate(train_data, dev_data, test_data, model, params):
     weights = class_counts.sum() / (2 * class_counts.float())
     weights = weights.to(device)
 
-    criterion = torch.nn.CrossEntropyLoss(weight=weights) #applying class weights to the loss funciton.
+    criterion = torch.nn.CrossEntropyLoss(weight=weights)
+
+    dev_fold = params.get('dev_set')
+    test_fold = params.get('test_set')
 
     dev_acc, dev_auc, test_acc, test_auc = 0, 0, 0, 0
     for epoch in range(params["num_epochs"]):
         train_loss = train_epoch(train_data, model, optimizer, criterion)
         if dev_data is not None:
-            dev_loss, dev_acc, dev_auc = evaluate_epoch(dev_data, model, criterion)
+            dev_loss, dev_acc, dev_auc = evaluate_epoch(dev_data, model, criterion, set_name="dev")
         if test_data is not None:
-            test_loss, test_acc, test_auc = evaluate_epoch(test_data, model, criterion)
+            test_loss, test_acc, test_auc = evaluate_epoch(test_data, model, criterion, set_name="test")
         with open("logs/per_epoch_loss.txt", "a") as file:
-            file.write(f"Epoch {epoch+1}/{params['num_epochs']}, Train Loss: {train_loss:.4f}, "
+            file.write(f"Dev Fold: {dev_fold}, Test Fold: {test_fold}, "
+                       f"Epoch {epoch+1}/{params['num_epochs']}, Train Loss: {train_loss:.4f}, "
                        f"Dev Loss: {dev_loss:.4f}, Test Loss: {test_loss:.4f}, "
                        f"Dev Acc: {dev_acc:.4f}, Dev AUC: {dev_auc:.4f}, "
                        f"Test Acc: {test_acc:.4f}, Test AUC: {test_auc:.4f}\n")
@@ -205,7 +208,7 @@ def train_epoch(train_data, model, optimizer, criterion):
 
     return cumulative_loss / total_samples
 
-def evaluate_epoch(dev_data, model, criterion):
+def evaluate_epoch(dev_data, model, criterion, set_name="eval"):
     """
     Evaluation with patient-level aggregation.
     Supports single-stream inputs (2 or 3 tuple items) and late fusion streams (4 tuple items).
@@ -217,8 +220,7 @@ def evaluate_epoch(dev_data, model, criterion):
 
     with torch.no_grad():
         for _, batch in enumerate(dev_data):
-            # 1. Unpack batch based on modality stream count
-            if len(batch) == 4:  # Late fusion: (cough_data, speech_data, labels, pids)
+            if len(batch) == 4:
                 cough_data, speech_data, labels, pids = batch
                 cough_data = cough_data.to(torch.float32).to(device)
                 speech_data = speech_data.to(torch.float32).to(device)
@@ -226,14 +228,14 @@ def evaluate_epoch(dev_data, model, criterion):
                 output = model(cough_data, speech_data)
                 batch_size = cough_data.size(0)
 
-            elif len(batch) == 3:  # Early fusion / Single-stream with PIDs: (input_data, labels, pids)
+            elif len(batch) == 3:
                 input_data, labels, pids = batch
                 input_data = input_data.to(torch.float32).to(device)
                 labels = labels.to(device)
                 output = model(input_data)
                 batch_size = input_data.size(0)
 
-            else:  # Fallback: (input_data, labels)
+            else:
                 input_data, labels = batch
                 pids = None
                 input_data = input_data.to(torch.float32).to(device)
@@ -241,10 +243,8 @@ def evaluate_epoch(dev_data, model, criterion):
                 output = model(input_data)
                 batch_size = input_data.size(0)
 
-            # 2. Extract positive class probabilities (FIXED LINE HERE)
             prob = torch.nn.functional.softmax(output, dim=1)[:, 1]
 
-            # 3. Patient-level aggregation tracking
             if pids is not None:
                 for i, pid in enumerate(pids):
                     if pid not in patient_probs:
@@ -261,25 +261,25 @@ def evaluate_epoch(dev_data, model, criterion):
             cumulative_loss += loss.item() * batch_size
             total_samples += batch_size
 
-    # 4. Average prediction probabilities across patient recordings
     agg_probs = []
     agg_labels = []
     for pid, probs_list in patient_probs.items():
         agg_probs.append(np.mean(probs_list))
         agg_labels.append(patient_labels[pid])
 
-    # 5. Compute performance metrics
     agg_probs = torch.tensor(agg_probs)
     agg_labels = torch.tensor(agg_labels)
     predictions = (agg_probs > 0.5).float()
-    
+
     acc = (predictions == agg_labels).float().mean()
     fpr, tpr, _ = metrics.roc_curve(agg_labels, agg_probs)
     auc = metrics.auc(fpr, tpr)
 
     cumulative_loss = cumulative_loss / total_samples
+
+    print(f"\n[{set_name.upper()}]")
+
     print("Predicted class counts:", torch.bincount(predictions.long(), minlength=2))
     print("Actual class counts:", torch.bincount(agg_labels.long(), minlength=2))
     print("Accuracy:", acc.item())
-    
     return cumulative_loss, acc.item(), auc
