@@ -9,7 +9,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Logistic regression class
 class Logistic_Regression(nn.Module):
-    def __init__(self, input_dim=128, num_classes=2):
+    def __init__(self, input_dim=2*224*224, num_classes=2):
         super(Logistic_Regression, self).__init__()
         self.linear = nn.Linear(input_dim, num_classes)
     def forward(self, x):
@@ -17,25 +17,34 @@ class Logistic_Regression(nn.Module):
 
 # ResNet18 class ->Trying wth frozen backbone and pretrained weights
 class ResNet18(nn.Module):
-    def __init__(self, num_classes=2,weights = ResNet18_Weights.IMAGENET1K_V1):
+    def __init__(self, num_classes=2,dropout_p =0.5,weights = ResNet18_Weights.IMAGENET1K_V1):
         super(ResNet18, self).__init__()
         self.resnet = resnet18(weights=weights)
-        self.resnet.fc = nn.Linear(512, num_classes)
 
         for parmams in self.resnet.parameters():
-            parmams.requires_grad = True # True unfreezes the backbone and allows it to be trained. False freezes the backbone and only trains the final layer
+            parmams.requires_grad = False # True unfreezes the backbone and allows it to be trained. False freezes the backbone and only trains the final layer
+        self.resnet.fc = nn.Sequential(
+                nn.Dropout(p=dropout_p),
+                nn.Linear(512,num_classes)
+                )
+        for params in self.resnet.layer3.parameters():
+            params.requires_grad = True
+        for params in self.resnet.layer4.parameters():
+            params.requires_grad = True
     def forward(self, x):
         return self.resnet(x)
 
 class ResNet18_encoder(nn.Module):
-    def __init__(self, num_classes=2,weights = ResNet18_Weights.IMAGENET1K_V1):
+    def __init__(self, num_classes=2,dropout_p=0.3,weights = ResNet18_Weights.IMAGENET1K_V1):
         super(ResNet18_encoder, self).__init__()
         self.resnet = resnet18(weights=weights)
+        self.dropout = nn.Dropout(p=dropout_p)
         #self.resnet.fc = nn.Linear(512, num_classes)
         for parmams in self.resnet.parameters():
             parmams.requires_grad = True # True unfreezes the backbone and allows it to be trained. False freezes the backbone and only trains the final layer
     def forward(self, x):
-        return self.resnet(x)
+        x = self.resnet(x)
+        return self.dropout(x)
 #LateFusion
 class LateFusion(nn.Module):
     def __init__(self, speech_encoding_method, num_classes=2, dropout_p=0.3):
@@ -55,8 +64,8 @@ class LateFusion(nn.Module):
             in_features = 512 + 512
 
         # 1. Asymmetric Branch Dropout (forces primary dependence on cough)
-        self.cough_dropout = nn.Dropout(p=0.2)
-        self.speech_dropout = nn.Dropout(p=0.5)
+        self.cough_dropout = nn.Dropout(p=0.3)
+        self.speech_dropout = nn.Dropout(p=0.3)
 
         # 2. Multi-Layer Bottleneck Head with Normalization
         self.classifier = nn.Sequential(
@@ -166,7 +175,7 @@ def train_validate(train_data, dev_data, test_data, model, params):
             dev_loss, dev_acc, dev_auc = evaluate_epoch(dev_data, model, criterion, set_name="dev")
         if test_data is not None:
             test_loss, test_acc, test_auc = evaluate_epoch(test_data, model, criterion, set_name="test")
-        with open("logs/per_epoch_loss.txt", "a") as file:
+        with open("logs/per_epoch_loss_2.txt", "a") as file:
             file.write(f"Dev Fold: {dev_fold}, Test Fold: {test_fold}, "
                        f"Epoch {epoch+1}/{params['num_epochs']}, Train Loss: {train_loss:.4f}, "
                        f"Dev Loss: {dev_loss:.4f}, Test Loss: {test_loss:.4f}, "

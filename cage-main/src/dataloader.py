@@ -4,35 +4,19 @@ import numpy as np
 import pandas as pd
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
 import torchvision.transforms.functional as TF
-
+import torchaudio
 # ======================================================================
 # AUGMENTATION FUNCTIONS
 # ======================================================================
 
 def time_mask(image, T=30):
-    if image.ndim == 3:
-        num_time_steps = image.shape[2]
-        t = np.random.randint(0, T)
-        t0 = np.random.randint(0, max(1, num_time_steps - t))
-        image[:, :, t0:t0+t] = 0
-    else:
-        num_time_steps = image.shape[1]
-        t = np.random.randint(0, T)
-        t0 = np.random.randint(0, max(1, num_time_steps - t))
-        image[:, t0:t0+t] = 0
+    masking = torchaudio.transforms.TimeMasking(time_mask_param = T)
+    image = masking(image)
     return image
 
-def frequency_mask(image, F=13):
-    if image.ndim == 3:
-        num_freq_bins = image.shape[1]
-        f = np.random.randint(0, F)
-        f0 = np.random.randint(0, max(1, num_freq_bins - f))
-        image[:, f0:f0+f, :] = 0
-    else:
-        num_freq_bins = image.shape[0]
-        f = np.random.randint(0, F)
-        f0 = np.random.randint(0, max(1, num_freq_bins - f))
-        image[f0:f0+f, :] = 0
+def frequency_mask(image, F=15):
+    masking = torchaudio.transforms.FrequencyMasking(freq_mask_param = F)
+    image = masking(image)
     return image
 
 def gaussian_noise(image, std=0.05):
@@ -49,7 +33,7 @@ def apply_augmentation(image, aug_type):
     elif aug_type == "gaussian_noise":
         return gaussian_noise(image)
     elif aug_type == "frequency_masking":
-        return frequency_mask(image, F=13)
+        return frequency_mask(image, F=15)
     elif aug_type == "time_masking":
         return time_mask(image, T=30)
     elif aug_type == "solarisation":
@@ -164,7 +148,7 @@ def get_data(dataset, data_folds, i, j, cough_dir, loss, batch_size, num_outer_f
 # ======================================================================
 
 class EarlyFusionFlatDataset(Dataset):
-    def __init__(self, annotations_file, cough_dir, speech_dir, cough_mean, cough_std, is_train=False, augmentation="none"):
+    def __init__(self, annotations_file, cough_dir, speech_dir, cough_mean, cough_std,arch, is_train=False, augmentation="none"):
         self.df = pd.read_csv(annotations_file)
         self.df['patient_id'] = self.df['Cough_ID'].astype(str).apply(lambda x: x.split('/')[0])
         self.df = self.df[self.df['Cough_ID'].astype(str).map(
@@ -175,7 +159,7 @@ class EarlyFusionFlatDataset(Dataset):
         self.patients = self.patients[self.patients['patient_id'].map(
             lambda pid: os.path.exists(os.path.join(speech_dir, f"{pid}.pt"))
         )].reset_index(drop=True)
-
+        self.arch = arch
         self.samples = []
         for _, row in self.patients.iterrows():
             pid = row['patient_id']
@@ -214,20 +198,39 @@ class EarlyFusionFlatDataset(Dataset):
 
         c_raw = torch.tensor(np.transpose(np.load(os.path.join(self.cough_dir, cid + ".npy"))), dtype=torch.float32)
         c_norm = (c_raw - self.cough_mean) / self.cough_std
-        c_augmented = apply_augmentation(c_norm, self.augmentation) if self.is_train and self.augmentation != "none" else c_norm
-        c_img = self._pad_to_224(c_augmented)
+        if self.arch == "resnet":
+            c_augmented = apply_augmentation(c_norm, self.augmentation) if self.is_train and self.augmentation != "none" else c_norm
+            c_img = self._pad_to_224(c_augmented)
 
-        c_min, c_max = c_img.min(), c_img.max()
-        c_scaled = (c_img - c_min) / (c_max - c_min + 1e-8) if c_max > c_min else c_img
+            c_min, c_max = c_img.min(), c_img.max()
+            c_scaled = (c_img - c_min) / (c_max - c_min + 1e-8) if c_max > c_min else c_img
 
-        m_speech = self._mean_speech_image(pid)
+            m_speech = self._mean_speech_image(pid)
+            if self.is_train  and self.augmentation !="none":
+                m_speech = apply_augmentation(m_speech,self.augmentation)
 
-        ch1 = c_scaled.unsqueeze(0)
-        ch2 = m_speech.unsqueeze(0)
-        ch3 = torch.abs(ch1 - ch2)
-        fused = torch.cat([ch1, ch2, ch3], dim=0)
+            ch1 = c_scaled.unsqueeze(0)
+            ch2 = m_speech.unsqueeze(0)
+            ch3 = torch.abs(ch1-ch2)
+            fused = torch.cat([ch1, ch1, ch2], dim=0)
+            fused = TF.normalize(fused, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        elif self.arch == "lr":
+            # Resize cough spectrogram (H x W) to fixed 224x224 to match speech
+            # c_norm is (H, W) with variable W (time). Use bilinear interpolation.
+            c_4d = c_norm.unsqueeze(0).unsqueeze(0)               # (1, 1, H, W)
+            c_resized = torch.nn.functional.interpolate(
+                c_4d, size=(224, 224), mode="bilinear", align_corners=False
+            ).squeeze(0).squeeze(0)                               # (224, 224)
 
-        fused = TF.normalize(fused, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            m_speech = self._mean_speech_image(pid).float()
+            if m_speech.ndim == 3:                                # (C, 224, 224) safety
+                m_speech = m_speech.mean(0)
+
+            c_flat = torch.flatten(c_resized)                     # (224*224,)
+            m_flat = torch.flatten(m_speech)                      # (224*224,)
+
+            fused = torch.cat([c_flat, m_flat], dim=0)            # (2*224*224,) = (100352,)
+            
         return fused, label, pid
 
 
@@ -235,7 +238,7 @@ class LateFusionDataset(Dataset):
     def __init__(self, annotations_file, cough_dir, speech_dir, cough_mean, cough_std, speech_arch, is_train=False, augmentation="none"):
         self.df = pd.read_csv(annotations_file)
         
-        # 1. Parse patient ID cleanly
+        # 1. Parse patient ID
         self.df['patient_id'] = self.df['Cough_ID'].astype(str).apply(lambda x: str(x).split('/')[0])
         
         # 2. Extract relative cough file path safely (handle missing or double .npy)
@@ -324,7 +327,7 @@ class LateFusionDataset(Dataset):
 # DATA LOADER FUNCTIONS FOR FUSION
 # ======================================================================
 
-def get_early_fusion_data(dataset, data_folds, i, j, cough_dir, speech_dir, loss, batch_size, num_outer_folds=10, augmentation="none"):
+def get_early_fusion_data(dataset, data_folds, i, j, cough_dir, speech_dir, loss, batch_size, arch,  num_outer_folds=10, augmentation="none"):
     train_folds_noext = [data_folds + f"/fold_{k}" for k in range(num_outer_folds) if k != j and k != i]
     train_folds_csv = [f + ".csv" for f in train_folds_noext]
     dev_file = data_folds + f"/fold_{j}.csv"
@@ -333,11 +336,11 @@ def get_early_fusion_data(dataset, data_folds, i, j, cough_dir, speech_dir, loss
     cough_mean, cough_std = get_mean_std(train_folds_noext, dataset, cough_dir, 128)
 
     train_ds = ConcatDataset([
-        EarlyFusionFlatDataset(f, cough_dir, speech_dir, cough_mean, cough_std, is_train=True, augmentation=augmentation)
+        EarlyFusionFlatDataset(f, cough_dir, speech_dir, cough_mean, cough_std, arch, is_train=True, augmentation=augmentation)
         for f in train_folds_csv
     ])
-    val_ds = EarlyFusionFlatDataset(dev_file, cough_dir, speech_dir, cough_mean, cough_std, is_train=False, augmentation=augmentation) if j is not None else None
-    test_ds = EarlyFusionFlatDataset(test_file, cough_dir, speech_dir, cough_mean, cough_std, is_train=False, augmentation=augmentation) if i is not None else None
+    val_ds = EarlyFusionFlatDataset(dev_file, cough_dir, speech_dir, cough_mean, cough_std,arch, is_train=False, augmentation=augmentation) if j is not None else None
+    test_ds = EarlyFusionFlatDataset(test_file, cough_dir, speech_dir, cough_mean, cough_std,arch, is_train=False, augmentation=augmentation) if i is not None else None
 
     def collate(batch):
         images, labels, pids = zip(*batch)
