@@ -5,8 +5,8 @@ import torchvision.transforms.functional as TF
 from tqdm import tqdm
 
 RAW_SPEECH_DIR = "data/cage/mel_spectrograms_counting_128"
-OUT_SPEECH_DIR = "data/cage/preprocessed_speech_224"
-TARGET_SIZE = 224
+OUT_SPEECH_DIR = "data/cage/preprocessed_speech"
+TARGET_SIZE = 128
 
 os.makedirs(OUT_SPEECH_DIR, exist_ok=True)
 
@@ -28,24 +28,29 @@ def preprocess_and_save():
         speech_files = [f for f in os.listdir(p_dir) if f.endswith(".npy")]
         
         if not speech_files:
-            mean_tensor = torch.zeros((TARGET_SIZE, TARGET_SIZE))
+            # Fallback to a zero-vector of length 128 (assuming 128 Mel bins)
+            mean_patient_vector = torch.zeros(128)
         else:
-            imgs = []
+            patient_vectors = []
             for f in speech_files:
+                # Load raw array, e.g., shape [128, T]
                 arr = np.load(os.path.join(p_dir, f))
-                tensor = torch.tensor(np.transpose(arr), dtype=torch.float32)
+                tensor = torch.tensor(arr, dtype=torch.float32) 
                 
-                # Rescale each recording to [0, 1] before padding
+                # Rescale to [0, 1] before pooling
                 t_min, t_max = tensor.min(), tensor.max()
                 if t_max > t_min:
                     tensor = (tensor - t_min) / (t_max - t_min)
                 
-                imgs.append(pad_to_224(tensor))
+                # AVERAGE POOL OVER TIME (Axis 1) -> Shape becomes [128]
+                time_averaged_vector = tensor.mean(dim=1) 
+                patient_vectors.append(time_averaged_vector)
             
-            # Average across patient recordings
-            mean_tensor = torch.stack(imgs).mean(0)  # (224, 224)
+            # Average the 1D vectors across the patient's recordings -> Final shape [128]
+            mean_patient_vector = torch.stack(patient_vectors).mean(0)
+            mean_patient_vector = mean_patient_vector.unsqueeze(1).repeat(1,43)
             
-        torch.save(mean_tensor, os.path.join(OUT_SPEECH_DIR, f"{pid}.pt"))
+        torch.save(mean_patient_vector, os.path.join(OUT_SPEECH_DIR, f"{pid}.pt"))
 
 if __name__ == "__main__":
     preprocess_and_save()

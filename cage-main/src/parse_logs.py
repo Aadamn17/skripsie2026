@@ -1,10 +1,11 @@
 from pathlib import Path
+
 import matplotlib.pyplot as plt
 import pandas as pd
 
 
 def process_csv_log(csv_path: Path):
-    """Parses summary metrics from a CSV log file and saves fold performance plots."""
+    """Parses metrics from a CSV log file and saves per-combo and mean plots."""
     if not csv_path.exists():
         print(f"Error: CSV log file not found at {csv_path}")
         return
@@ -14,54 +15,151 @@ def process_csv_log(csv_path: Path):
 
     df = pd.read_csv(csv_path)
 
-    if "test_set" not in df.columns:
+    required_cols = {
+        "test_set",
+        "dev_set",
+        "epoch",
+        "train_loss",
+        "dev_loss",
+        "test_loss",
+        "dev_acc",
+        "dev_auc",
+        "test_acc",
+        "test_auc",
+    }
+    missing = required_cols - set(df.columns)
+    if missing:
         print(
-            f"Error: 'test_set' column missing in {csv_path.name}. Found"
-            f" columns: {list(df.columns)}"
+            f"Error: Missing columns in {csv_path.name}: {sorted(missing)}. "
+            f"Found columns: {list(df.columns)}"
         )
         return
 
     print(f"Processing CSV log: {csv_path.name}")
 
-    # Plot AUC performance across dev sets for each test set split
+    # Collapse duplicated runs of the same (test_set, dev_set, epoch) by averaging.
+    df = (
+        df.groupby(["test_set", "dev_set", "epoch"], as_index=False)
+        .agg(
+            train_loss=("train_loss", "mean"),
+            dev_loss=("dev_loss", "mean"),
+            test_loss=("test_loss", "mean"),
+            dev_acc=("dev_acc", "mean"),
+            dev_auc=("dev_auc", "mean"),
+            test_acc=("test_acc", "mean"),
+            test_auc=("test_auc", "mean"),
+        )
+    )
+
+    # ----- Per (test_set, dev_set) plots -----
     for test_fold, test_df in df.groupby("test_set"):
         test_dir = output_dir / f"Test_Fold_{test_fold}"
         test_dir.mkdir(exist_ok=True)
 
+        for dev_fold, dev_df in test_df.groupby("dev_set"):
+            dev_df = dev_df.sort_values("epoch")
+
+            # ---- Loss curves ----
+            plt.figure(figsize=(8, 5))
+            plt.plot(
+                dev_df["epoch"],
+                dev_df["train_loss"],
+                marker="o",
+                linewidth=2,
+                label="Train Loss",
+            )
+            plt.plot(
+                dev_df["epoch"],
+                dev_df["dev_loss"],
+                marker="s",
+                linewidth=2,
+                label="Dev Loss",
+            )
+            plt.plot(
+                dev_df["epoch"],
+                dev_df["test_loss"],
+                marker="^",
+                linewidth=2,
+                label="Test Loss",
+            )
+            plt.title(f"Loss Curves | Test Fold {test_fold} - Dev Fold {dev_fold}")
+            plt.xlabel("Epoch")
+            plt.ylabel("Loss")
+            plt.grid(True, linestyle="--", alpha=0.6)
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(
+                test_dir / f"loss_test{test_fold}_dev{dev_fold}.png", dpi=300
+            )
+            plt.close()
+
+            # ---- AUC curves ----
+            plt.figure(figsize=(8, 5))
+            plt.plot(
+                dev_df["epoch"],
+                dev_df["dev_auc"],
+                marker="o",
+                linewidth=2,
+                label="Dev AUC",
+                color="#ff7f0e",
+            )
+            plt.plot(
+                dev_df["epoch"],
+                dev_df["test_auc"],
+                marker="s",
+                linewidth=2,
+                label="Test AUC",
+                color="#2ca02c",
+            )
+            plt.title(f"AUC Curves | Test Fold {test_fold} - Dev Fold {dev_fold}")
+            plt.xlabel("Epoch")
+            plt.ylabel("AUC")
+            plt.ylim(0.0, 1.05)
+            plt.grid(True, linestyle="--", alpha=0.6)
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(
+                test_dir / f"auc_test{test_fold}_dev{dev_fold}.png", dpi=300
+            )
+            plt.close()
+
+        # ---- Mean AUC across dev folds for this test fold ----
+        mean_df = (
+            test_df.groupby("epoch", as_index=False)
+            .agg(dev_auc=("dev_auc", "mean"), test_auc=("test_auc", "mean"))
+            .sort_values("epoch")
+        )
+
         plt.figure(figsize=(8, 5))
-        x_labels = test_df["dev_set"].astype(str)
-
         plt.plot(
-            x_labels,
-            test_df["dev_auc"],
+            mean_df["epoch"],
+            mean_df["dev_auc"],
             marker="o",
-            label="Dev AUC",
-            color="#ff7f0e",
             linewidth=2,
+            label="Mean Dev AUC",
+            color="#ff7f0e",
         )
         plt.plot(
-            x_labels,
-            test_df["test_auc"],
+            mean_df["epoch"],
+            mean_df["test_auc"],
             marker="s",
-            label="Test AUC",
-            color="#2ca02c",
             linewidth=2,
+            label="Mean Test AUC",
+            color="#2ca02c",
         )
-
-        plt.title(f"Fold AUC Performance | Test Fold {test_fold}")
-        plt.xlabel("Dev Fold")
-        plt.ylabel("AUC")
+        plt.title(f"Mean AUC Across Dev Folds | Test Fold {test_fold}")
+        plt.xlabel("Epoch")
+        plt.ylabel("Mean AUC")
         plt.ylim(0.0, 1.05)
         plt.grid(True, linestyle="--", alpha=0.6)
         plt.legend()
         plt.tight_layout()
-
         plt.savefig(
-            test_dir / f"auc_summary_test_fold_{test_fold}.png", dpi=300
+            test_dir / f"mean_auc_test_fold_{test_fold}.png", dpi=300
         )
         plt.close()
 
-    # Output experiment summary statistics across all folds
+    # ----- Overall summary across the entire CSV -----
     mean_metrics = df[["dev_acc", "dev_auc", "test_acc", "test_auc"]].mean()
     print(f"\n--- Summary Metrics ({csv_path.name}) ---")
     print(f"Mean Dev Acc:  {mean_metrics['dev_acc']:.4f}")
@@ -75,8 +173,7 @@ if __name__ == "__main__":
     script_dir = Path(__file__).resolve().parent
     logs_dir = script_dir.parent / "logs"
 
-    # Automatically find and process all .csv files in /cage-main/logs/
-    csv_files = sorted(list(logs_dir.glob("*.csv")))
+    csv_files = sorted(logs_dir.glob("*.csv"))
 
     if not csv_files:
         print(f"No CSV files found in directory: {logs_dir}")
