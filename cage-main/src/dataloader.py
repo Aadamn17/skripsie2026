@@ -147,11 +147,11 @@ def get_data(dataset, data_folds, i, j, cough_dir, loss, batch_size,
                 torch.tensor(labels, dtype=torch.long),
                 list(pids))
 
-    train_data = DataLoader(train_data_set, batch_size=batch_size, num_workers=0,
+    train_data = DataLoader(train_data_set, batch_size=batch_size, num_workers=4,
                             shuffle=True, drop_last=True, collate_fn=collate)
-    val_data = DataLoader(val_ds, batch_size=batch_size, num_workers=0,
+    val_data = DataLoader(val_ds, batch_size=batch_size, num_workers=4,
                           shuffle=False, collate_fn=collate) if val_ds else None
-    test_data = DataLoader(test_ds, batch_size=batch_size, num_workers=0,
+    test_data = DataLoader(test_ds, batch_size=batch_size, num_workers=4,
                            shuffle=False, collate_fn=collate) if test_ds else None
 
     return train_data, val_data, test_data
@@ -303,11 +303,11 @@ def get_early_fusion_data(dataset, data_folds, i, j, cough_dir, speech_dir, loss
                 list(pids))
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                              num_workers=0, drop_last=True, collate_fn=collate)
+                              num_workers=4, drop_last=True, collate_fn=collate)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
-                            num_workers=0, drop_last=False, collate_fn=collate) \
+                            num_workers=4, drop_last=False, collate_fn=collate) \
         if val_ds else None
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False,
-                             num_workers=0, drop_last=False, collate_fn=collate) \
+                             num_workers=4, drop_last=False, collate_fn=collate) \
         if test_ds else None
     return train_loader, val_loader, test_loader
