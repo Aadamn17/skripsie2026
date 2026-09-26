@@ -24,10 +24,10 @@ grid = {
     'learning_rate': [1e-4],
     'weight_decay': [1e-2],
     'dataset': ["cage"],
-    'arch': ["resnet", "lr"],           # "resnet" | "lr"
+    'arch': ["resnet"],           # "resnet" | "lr"
     'fusion': ["early", "none"],        # "early" | "none"
-    'use_pretrained': [True, False],    # only affects ResNet configurations
-    'augmentation': ["time_masking"],
+    'use_pretrained': [True],    # only affects ResNet configurations
+    'augmentation': ["none"],# "none" , "gaussian_noise" , "solarisation"
 
     # Early stopping (AUC selection, smoothed, with min-epochs guard)
     'early_stop_patience':   [7],
