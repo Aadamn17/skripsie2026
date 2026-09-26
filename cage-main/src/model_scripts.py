@@ -69,9 +69,9 @@ class EarlyStopper:
 
 
 class Logistic_Regression(nn.Module):
-    def __init__(self, fusion_type, input_dim, num_classes=2):
+    def __init__(self, fusion_type="none", input_dim=128, num_classes=2):
         super(Logistic_Regression, self).__init__()
-        self.linear = nn.Linear(input_dim,num_classes)
+        self.linear = nn.Linear(input_dim, num_classes)
 
     def forward(self, x):
         return self.linear(x)

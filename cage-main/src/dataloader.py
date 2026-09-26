@@ -100,40 +100,64 @@ def get_mean_std(train_set_files, dataset, dir, inner_bins=128):
 
 class CoughDatasetCleaned(Dataset):
     def __init__(self, dataset, annotations_file, dir, loss, mean, std,
-                 fusion_type, augmentation="none"):
-        self.labels       = pd.read_csv(annotations_file)
+                 fusion_type, is_train=False, augmentation="none"):
+        self.labels = pd.read_csv(annotations_file)
+        self.labels["patient_id"] = self.labels["Cough_ID"].astype(str).apply(
+            lambda x: x.split("/")[0]
+        )
         self.dataset      = dataset
         self.dir          = dir
         self.loss         = loss
         self.mean         = mean
         self.std          = std
         self.fusion_type  = fusion_type
+        self.is_train     = is_train
         self.augmentation = augmentation
 
     def __len__(self):
         return len(self.labels)
 
+    def _pad_to_224(self, img):
+        if img.ndim == 2:
+            img = img.unsqueeze(0)
+        H, W = img.shape[-2], img.shape[-1]
+        pad_h = max(0, 224 - H)
+        pad_w = max(0, 224 - W)
+        if pad_h > 0 or pad_w > 0:
+            img = torch.nn.functional.pad(img, (0, pad_w, 0, pad_h), "constant", 0)
+        return img[0]
+
     def __getitem__(self, idx):
         label = self.labels["Status"][idx]
+        pid   = self.labels["patient_id"][idx]
         path  = os.path.join(self.dir, str(self.labels["Cough_ID"][idx]) + ".npy")
         image_raw = torch.tensor(np.transpose(np.load(path)), dtype=torch.float32)
 
         if self.loss == "cross_entropy":
+            # LR baseline: per-bin standardize -> time-average -> [128]
             image = (image_raw - self.mean) / self.std
-            return image.mean(0), label
+            return image.mean(0), label, pid
+
         elif self.loss == "cross_entropy_resnet":
             if self.fusion_type == "none":
+                # 1. per-bin standardize
                 image = (image_raw - self.mean) / self.std
-                image = image[None, :, :].repeat(3, 1, 1)
-                if (image.shape[-1] < 224) or (image.shape[-2] < 224):
-                    pad_h = max(0, 224 - image.shape[-2])
-                    pad_w = max(0, 224 - image.shape[-1])
-                    image = torch.nn.functional.pad(
-                        image, (0, pad_w, 0, pad_h), "constant", 0
-                    )
-                if self.augmentation != "none":
+                # 2. pad to 224x224
+                image = self._pad_to_224(image)
+                # 3. deterministic rescale bounds on the clean padded image
+                c_min, c_max = image.min(), image.max()
+                # 4. augment on normalized data (train only)
+                if self.is_train and self.augmentation != "none":
                     image = apply_augmentation(image, self.augmentation)
-                return image, label
+                # 5. rescale to [0, 1] using precomputed bounds
+                image = (image - c_min) / (c_max - c_min + 1e-8)
+                # 6. repeat to 3 channels
+                image = image.unsqueeze(0).repeat(3, 1, 1)
+                # 7. ImageNet normalize (same as early fusion)
+                image = TF.normalize(image,
+                                     mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225])
+                return image, label, pid
 
 
 def get_data(dataset, data_folds, i, j, cough_dir, loss, batch_size,
@@ -146,23 +170,28 @@ def get_data(dataset, data_folds, i, j, cough_dir, loss, batch_size,
 
     train_data_set = ConcatDataset([
         CoughDatasetCleaned(dataset, file + ".csv", cough_dir, loss, mean, std,
-                            "none", augmentation)
+                            "none", is_train=True, augmentation=augmentation)
         for file in train_set_files
     ])
+    val_ds = CoughDatasetCleaned(dataset, dev_set_file + ".csv", cough_dir, loss,
+                                 mean, std, "none", is_train=False,
+                                 augmentation=augmentation) if j is not None else None
+    test_ds = CoughDatasetCleaned(dataset, test_set_file + ".csv", cough_dir, loss,
+                                  mean, std, "none", is_train=False,
+                                  augmentation=augmentation) if i is not None else None
+
+    def collate(batch):
+        images, labels, pids = zip(*batch)
+        return (torch.stack(images),
+                torch.tensor(labels, dtype=torch.long),
+                list(pids))
+
     train_data = DataLoader(train_data_set, batch_size=batch_size, num_workers=2,
-                            shuffle=True, drop_last=True)
-
-    val_data = DataLoader(
-        CoughDatasetCleaned(dataset, dev_set_file + ".csv", cough_dir, loss, mean, std,
-                            "none", augmentation),
-        batch_size=batch_size, num_workers=2, shuffle=False
-    ) if j is not None else None
-
-    test_data = DataLoader(
-        CoughDatasetCleaned(dataset, test_set_file + ".csv", cough_dir, loss, mean, std,
-                            "none", augmentation),
-        batch_size=batch_size, num_workers=2, shuffle=False
-    ) if i is not None else None
+                            shuffle=True, drop_last=True, collate_fn=collate)
+    val_data = DataLoader(val_ds, batch_size=batch_size, num_workers=2,
+                          shuffle=False, collate_fn=collate) if val_ds else None
+    test_data = DataLoader(test_ds, batch_size=batch_size, num_workers=2,
+                           shuffle=False, collate_fn=collate) if test_ds else None
 
     return train_data, val_data, test_data
 
