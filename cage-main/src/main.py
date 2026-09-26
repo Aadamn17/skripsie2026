@@ -1,8 +1,8 @@
 # ------------------------------------------------------------------
 # main.py
-# Grid search over hyperparameters. Trains each (fusion, arch,
-# use_pretrained, augmentation, ...) combination on all 10×9 fold
-# pairs, logging every epoch to a CSV per hyperparameter combination.
+# Grid search. Trains each (fusion, arch, use_pretrained,
+# augmentation) combination on all fold pairs, logging every
+# epoch to a CSV per hyperparameter combination in results/.
 # ------------------------------------------------------------------
 import itertools
 import os
@@ -13,23 +13,22 @@ from model_scripts import *
 
 
 # ------------------------------------------------------------------
-# Hyperparameter grid
+# Hyperparameter grid  (pilot: 10 fold pairs, ResNet only, no aug)
 # ------------------------------------------------------------------
 grid = {
     'loss_selected': ["cross_entropy_resnet"],
     'test_set': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
-    'dev_set':  [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+    'dev_set':  [1, 2, 3, 4, 5, 6, 7, 8, 9, 0],
     'num_epochs': [40],
     'batch_size': [32],
     'learning_rate': [1e-4],
     'weight_decay': [1e-2],
     'dataset': ["cage"],
-    'arch': ["resnet", "lr"],           # "resnet" | "lr"
-    'fusion': ["early", "none"],        # "early" | "none"
-    'use_pretrained': [True, False],    # only affects ResNet configurations
-    'augmentation': ["time_masking"],
+    'arch': ["resnet"],
+    'fusion': ["early", "none"],
+    'use_pretrained': [True, False],
+    'augmentation': ["none"],
 
-    # Early stopping (AUC selection, smoothed, with min-epochs guard)
     'early_stop_patience':   [7],
     'early_stop_min_delta':  [1e-3],
     'early_stop_min_epochs': [10],
@@ -64,7 +63,7 @@ def build_log_filename(point):
         f"_ep{point['num_epochs']}"
         f".csv"
     )
-    return os.path.join("logs", filename)
+    return os.path.join("results", filename)
 
 
 def main(grid):
@@ -72,7 +71,7 @@ def main(grid):
     torch.manual_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    os.makedirs("logs", exist_ok=True)
+    os.makedirs("results", exist_ok=True)
 
     header = (
         "fusion,dataset,test_set,dev_set,arch,use_pretrained,augmentation,"
@@ -88,7 +87,6 @@ def main(grid):
         if point['test_set'] == point['dev_set']:
             continue
 
-        # LR baseline does not use pretrained weights -> skip duplicate runs
         if point['arch'] == "lr" and point['use_pretrained'] is False:
             continue
 
@@ -109,50 +107,22 @@ def main(grid):
                 arch=point['arch'],
                 augmentation=point['augmentation'],
             )
-            if point['arch'] == "resnet":
-                model = ResNet18(fusion_type="none", num_classes=2,
-                                 use_pretrained=point['use_pretrained']).to(device)
-            elif point['arch'] == "lr":
-                model = Logistic_Regression(
-                    fusion_type="none",
-                    input_dim=2 * 224 * 224,
-                    num_classes=2,
-                ).to(device)
-            else:
-                raise ValueError(f"Unknown arch for early fusion: {point['arch']}")
+            model = ResNet18(fusion_type="none", num_classes=2,
+                             use_pretrained=point['use_pretrained']).to(device)
 
         elif point['fusion'] == "none":
-            if point['arch'] == "lr":
-                # LR baseline: time-averaged raw log-mel -> [128]
-                train, val, test = get_data(
-                    dataset=point['dataset'],
-                    data_folds="data/" + point['dataset'] + "/data_folds_filtered",
-                    i=point['test_set'], j=point['dev_set'],
-                    cough_dir=cough_dir,
-                    loss="cross_entropy",
-                    batch_size=point['batch_size'],
-                    num_outer_folds=10,
-                    augmentation="none",
-                )
-                model = Logistic_Regression(
-                    fusion_type="none",
-                    input_dim=128,
-                    num_classes=2,
-                ).to(device)
-            else:
-                # Cough-only ResNet-18 baseline
-                train, val, test = get_data(
-                    dataset=point['dataset'],
-                    data_folds="data/" + point['dataset'] + "/data_folds_filtered",
-                    i=point['test_set'], j=point['dev_set'],
-                    cough_dir=cough_dir,
-                    loss=point['loss_selected'],
-                    batch_size=point['batch_size'],
-                    num_outer_folds=10,
-                    augmentation=point['augmentation'],
-                )
-                model = ResNet18(fusion_type="none", num_classes=2,
-                                 use_pretrained=point['use_pretrained']).to(device)
+            train, val, test = get_data(
+                dataset=point['dataset'],
+                data_folds="data/" + point['dataset'] + "/data_folds_filtered",
+                i=point['test_set'], j=point['dev_set'],
+                cough_dir=cough_dir,
+                loss=point['loss_selected'],
+                batch_size=point['batch_size'],
+                num_outer_folds=10,
+                augmentation=point['augmentation'],
+            )
+            model = ResNet18(fusion_type="none", num_classes=2,
+                             use_pretrained=point['use_pretrained']).to(device)
 
         else:
             raise ValueError(f"Unknown fusion: {point['fusion']}")
