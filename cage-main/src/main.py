@@ -1,10 +1,8 @@
 # ------------------------------------------------------------------
 # main.py
-# Runs the hyperparameter grid. For each hyperparameter combination,
-# trains a model on all 10×9 fold pairs and logs every single epoch's
-# metrics (train_loss, dev_loss_patient, dev_loss_cough, dev_acc,
-# dev_auc, test_loss_patient, test_loss_cough, test_acc, test_auc,
-# is_best) to a CSV file named after the hyperparameters.
+# Grid search over hyperparameters. Trains each (fusion, arch,
+# use_pretrained, augmentation, ...) combination on all 10×9 fold
+# pairs, logging every epoch to a CSV per hyperparameter combination.
 # ------------------------------------------------------------------
 import itertools
 import os
@@ -12,7 +10,6 @@ import random
 import torch
 from dataloader import *
 from model_scripts import *
-from torchvision.models import ResNet18_Weights
 
 
 # ------------------------------------------------------------------
@@ -28,7 +25,8 @@ grid = {
     'weight_decay': [1e-2],
     'dataset': ["cage"],
     'arch': ["resnet", "lr"],           # "resnet" | "lr"
-    'fusion': ["early", "none"],        # "early" | "late" | "none" | "intermediate"
+    'fusion': ["early", "none"],        # "early" | "none"
+    'use_pretrained': [True, False],    # only affects ResNet configurations
     'augmentation': ["time_masking"],
 
     # Early stopping (AUC selection, smoothed, with min-epochs guard)
@@ -45,13 +43,9 @@ speech_dir = "data/cage/preprocessed_speech"
 
 
 # ------------------------------------------------------------------
-# Build a descriptive log filename from the hyperparameters only.
-# Every fold pair (test_set, dev_set) for the same hyperparameters
-# will append to the SAME file. Fold IDs are stored per row.
+# Log filename
 # ------------------------------------------------------------------
 def build_log_filename(point):
-    # The LR baseline uses a different input path than ResNet models,
-    # so tag its filename with the loss it actually uses.
     if point['fusion'] == "none" and point['arch'] == "lr":
         loss_tag = "cross_entropy"
     else:
@@ -61,6 +55,7 @@ def build_log_filename(point):
         f"{point['fusion']}"
         f"_{point['dataset']}"
         f"_{point['arch']}"
+        f"_pretrained-{point['use_pretrained']}"
         f"_{point['augmentation']}"
         f"_loss-{loss_tag}"
         f"_lr{point['learning_rate']}"
@@ -80,7 +75,8 @@ def main(grid):
     os.makedirs("logs", exist_ok=True)
 
     header = (
-        "fusion,dataset,test_set,dev_set,augmentation,lr,wd,batch_size,"
+        "fusion,dataset,test_set,dev_set,arch,use_pretrained,augmentation,"
+        "lr,wd,batch_size,"
         "epoch,train_loss,"
         "dev_loss_patient,dev_loss_cough,dev_acc,dev_auc,"
         "test_loss_patient,test_loss_cough,test_acc,test_auc,is_best\n"
@@ -92,11 +88,15 @@ def main(grid):
         if point['test_set'] == point['dev_set']:
             continue
 
+        # LR baseline does not use pretrained weights -> skip duplicate runs
+        if point['arch'] == "lr" and point['use_pretrained'] is False:
+            continue
+
         log_file     = build_log_filename(point)
         write_header = not os.path.exists(log_file)
 
         # ------------------------------------------------------------------
-        # 1. Build the data loaders and model for this grid point
+        # 1. Build data loaders and model
         # ------------------------------------------------------------------
         if point['fusion'] == "early":
             train, val, test = get_early_fusion_data(
@@ -111,45 +111,36 @@ def main(grid):
             )
             if point['arch'] == "resnet":
                 model = ResNet18(fusion_type="none", num_classes=2,
-                                 weights=ResNet18_Weights.IMAGENET1K_V1).to(device)
+                                 use_pretrained=point['use_pretrained']).to(device)
             elif point['arch'] == "lr":
-                model = Logistic_Regression(input_dim=2 * 224 * 224,
-                                            num_classes=2).to(device)
+                model = Logistic_Regression(
+                    fusion_type="none",
+                    input_dim=2 * 224 * 224,
+                    num_classes=2,
+                ).to(device)
             else:
                 raise ValueError(f"Unknown arch for early fusion: {point['arch']}")
 
-        elif point['fusion'] == "intermediate":
-            train, val, test = get_early_fusion_data(
-                dataset=point['dataset'],
-                data_folds="data/" + point['dataset'] + "/data_folds_filtered",
-                i=point['test_set'], j=point['dev_set'],
-                cough_dir=cough_dir, speech_dir=speech_dir,
-                loss=point['loss_selected'], batch_size=point['batch_size'],
-                num_outer_folds=10,
-                augmentation=point['augmentation'],
-            )
-            model = Intermediate(num_classes=2).to(device)
-
         elif point['fusion'] == "none":
             if point['arch'] == "lr":
-                # LR baseline: per-bin standardize -> time-average -> [128] vector
+                # LR baseline: time-averaged raw log-mel -> [128]
                 train, val, test = get_data(
                     dataset=point['dataset'],
                     data_folds="data/" + point['dataset'] + "/data_folds_filtered",
                     i=point['test_set'], j=point['dev_set'],
                     cough_dir=cough_dir,
-                    loss="cross_entropy",             # LR-specific input path
+                    loss="cross_entropy",
                     batch_size=point['batch_size'],
                     num_outer_folds=10,
-                    augmentation="none",              # no augmentation for LR
+                    augmentation="none",
                 )
                 model = Logistic_Regression(
                     fusion_type="none",
-                    input_dim=128,                    # [128] time-averaged vector
+                    input_dim=128,
                     num_classes=2,
                 ).to(device)
             else:
-                # Cough-only ResNet18 baseline
+                # Cough-only ResNet-18 baseline
                 train, val, test = get_data(
                     dataset=point['dataset'],
                     data_folds="data/" + point['dataset'] + "/data_folds_filtered",
@@ -160,32 +151,19 @@ def main(grid):
                     num_outer_folds=10,
                     augmentation=point['augmentation'],
                 )
-                model = ResNet18(fusion_type="none", num_classes=2).to(device)
-
-        elif point['fusion'] == 'late':
-            train, val, test = get_late_fusion_data(
-                dataset=point['dataset'],
-                data_folds="data/" + point['dataset'] + "/data_folds_filtered",
-                i=point['test_set'], j=point['dev_set'],
-                cough_dir=cough_dir, speech_dir=speech_dir,
-                loss=point['loss_selected'], batch_size=point['batch_size'],
-                num_outer_folds=10,
-                augmentation=point['augmentation'],
-                speech_arch=point['arch'],
-            )
-            model = LateFusion(speech_encoding_method=point['arch'],
-                               num_classes=2).to(device)
+                model = ResNet18(fusion_type="none", num_classes=2,
+                                 use_pretrained=point['use_pretrained']).to(device)
 
         else:
             raise ValueError(f"Unknown fusion: {point['fusion']}")
 
         # ------------------------------------------------------------------
-        # 2. Train and collect full per-epoch history
+        # 2. Train
         # ------------------------------------------------------------------
         history = train_validate(train, val, test, model, point)
 
         # ------------------------------------------------------------------
-        # 3. Write every epoch of this fold to the log file
+        # 3. Write per-epoch history
         # ------------------------------------------------------------------
         with open(log_file, "a") as f:
             if write_header:
@@ -195,6 +173,7 @@ def main(grid):
                 f.write(
                     f"{point['fusion']},{point['dataset']},"
                     f"{point['test_set']},{point['dev_set']},"
+                    f"{point['arch']},{point['use_pretrained']},"
                     f"{point['augmentation']},{point['learning_rate']},"
                     f"{point['weight_decay']},{point['batch_size']},"
                     f"{h['epoch']},{h['train_loss']:.4f},"

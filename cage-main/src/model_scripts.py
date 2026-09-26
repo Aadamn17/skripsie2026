@@ -1,5 +1,4 @@
 # imports
-import copy
 import torch
 import numpy as np
 from sklearn import metrics
@@ -15,9 +14,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class EarlyStopper:
     """Stops training when the monitored metric hasn't improved for `patience`
-    epochs. Supports mode='min' (loss) and mode='max' (AUC). Smooths over
-    `window` epochs to suppress single-epoch noise, and never stops before
-    `min_epochs`."""
+    epochs. Smooths over `window` epochs and never stops before `min_epochs`."""
     def __init__(self, patience=7, min_delta=1e-3, mode="max",
                  window=3, min_epochs=10):
         self.patience    = patience
@@ -33,7 +30,6 @@ class EarlyStopper:
         self.history     = []
 
     def step(self, value, model, epoch):
-        # NaN (e.g. AUC undefined when only one class is present) -> non-improvement
         if value is None or (isinstance(value, float) and value != value):
             self.counter += 1
             if self.counter >= self.patience and epoch >= self.min_epochs:
@@ -68,7 +64,13 @@ class EarlyStopper:
             model.load_state_dict(self.best_state)
 
 
+# ======================================================================
+# MODELS
+# ======================================================================
+
 class Logistic_Regression(nn.Module):
+    """Single linear layer. Used as a baseline and as a low-capacity
+    classifier on top of frozen features."""
     def __init__(self, fusion_type="none", input_dim=128, num_classes=2):
         super(Logistic_Regression, self).__init__()
         self.linear = nn.Linear(input_dim, num_classes)
@@ -78,192 +80,94 @@ class Logistic_Regression(nn.Module):
 
 
 class ResNet18(nn.Module):
-    """Single-stream ResNet18. fusion_type='late' leaves FC untouched
-    (used only when you want the raw encoder head)."""
+    """Single-stream ResNet-18 with the classification head replaced by
+    Dropout + Linear.
+
+    The freeze policy is coupled to the pretrained-weights choice:
+      * use_pretrained=True  -> freeze all backbone, unfreeze only layer4 + head
+      * use_pretrained=False -> all parameters trainable (train from scratch)
+    """
     def __init__(self, fusion_type="none", num_classes=2, dropout_p=0.3,
-                 weights=ResNet18_Weights.IMAGENET1K_V1):
+                 use_pretrained=True):
         super(ResNet18, self).__init__()
-        self.fusion_type = fusion_type
+        self.fusion_type    = fusion_type
+        self.use_pretrained = use_pretrained
+
+        weights = ResNet18_Weights.IMAGENET1K_V1 if use_pretrained else None
         self.resnet = resnet18(weights=weights)
 
-        for p in self.resnet.parameters():
-            p.requires_grad = False
-
-        if self.fusion_type != "late":
-            self.resnet.fc = nn.Sequential(
-                nn.Dropout(p=dropout_p),
-                nn.Linear(512, num_classes),
-            )
+        if use_pretrained:
+            # Transfer learning: freeze the whole backbone...
+            for p in self.resnet.parameters():
+                p.requires_grad = False
         else:
-            # fc replaced by Dropout — but it will be overwritten by LateFusion
-            self.resnet.fc = nn.Dropout(p=dropout_p)
+            # From scratch: everything trainable.
+            for p in self.resnet.parameters():
+                p.requires_grad = True
 
-        '''for p in self.resnet.layer3.parameters():
-            p.requires_grad = True'''
-        for p in self.resnet.layer4.parameters():
-            p.requires_grad = True
+        # Replace the classifier head.
+        self.resnet.fc = nn.Sequential(
+            nn.Dropout(p=dropout_p),
+            nn.Linear(512, num_classes),
+        )
+
+        if use_pretrained:
+            # ...then unfreeze only the final residual block.
+            for p in self.resnet.layer4.parameters():
+                p.requires_grad = True
 
     def forward(self, x):
         return self.resnet(x)
 
 
-class ResNet18_encoder(nn.Module):
-    """ResNet18 backbone that outputs a 512-d feature vector (no classifier)."""
-    def __init__(self, num_classes=2, dropout_p=0.5,
-                 weights=ResNet18_Weights.IMAGENET1K_V1):
-        super(ResNet18_encoder, self).__init__()
-        self.resnet = resnet18(weights=weights)
-        self.resnet.fc = nn.Identity()   # -> [B, 512]
-        self.dropout = nn.Dropout(p=dropout_p)
-
-        for p in self.resnet.parameters():
-            p.requires_grad = True
-
-    def forward(self, x):
-        x = self.resnet(x)
-        return self.dropout(x)
-
-
-class LateFusion(nn.Module):
-    def __init__(self, speech_encoding_method, num_classes=2, dropout_p=0.3):
-        super(LateFusion, self).__init__()
-        self.speech_encoding_method = speech_encoding_method
-
-        # Encoders
-        self.cough_model = ResNet18_encoder(num_classes=num_classes)
-        # cough_model.resnet.fc is already nn.Identity()
-
-        if self.speech_encoding_method == "lr":
-            # LR -> 512 so it can concat with the cough encoder output
-            self.speech_model = Logistic_Regression(
-                fusion_type="late", input_dim=224 * 224, num_classes=num_classes
-            )
-            in_features = 512 + 512
-        elif self.speech_encoding_method == "resnet":
-            self.speech_model = ResNet18_encoder(num_classes=num_classes)
-            in_features = 512 + 512
-        else:
-            raise ValueError(f"Unknown speech_encoding_method: {speech_encoding_method}")
-
-        # Stream-level dropout
-        self.cough_dropout  = nn.Dropout(p=0.3)
-        self.speech_dropout = nn.Dropout(p=0.3)
-
-        # Classifier head
-        self.classifier = nn.Sequential(
-            nn.BatchNorm1d(in_features),
-            nn.Dropout(p=dropout_p),
-            nn.Linear(in_features, 256),
-            nn.ReLU(),
-            nn.BatchNorm1d(256),
-            nn.Dropout(p=dropout_p),
-            nn.Linear(256, num_classes),
-        )
-
-    def forward(self, cough_input, speech_input):
-        cough_output = self.cough_model(cough_input)
-
-        # LR expects [B, 224*224]; speech_input arrives as [B, 1, 224, 224]
-        if self.speech_encoding_method == "lr":
-            speech_input = speech_input.view(speech_input.size(0), -1)
-
-        speech_output = self.speech_model(speech_input)
-
-        cough_output  = self.cough_dropout(cough_output)
-        speech_output = self.speech_dropout(speech_output)
-
-        combined = torch.cat((cough_output, speech_output), dim=1)
-        return self.classifier(combined)
-
-
-class Intermediate(nn.Module):
-    def __init__(self, num_classes):
-        super(Intermediate, self).__init__()
-        resnetcough = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
-        self.cough_base = nn.Sequential(
-            resnetcough.conv1,
-            resnetcough.bn1,
-            resnetcough.relu,
-            resnetcough.maxpool,
-            resnetcough.layer1,
-            resnetcough.layer2,
-            resnetcough.layer3,
-        )
-        resnetspeech = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
-        self.speech_base = nn.Sequential(
-            resnetspeech.conv1,
-            resnetspeech.bn1,
-            resnetspeech.relu,
-            resnetspeech.maxpool,
-            resnetspeech.layer1,
-            resnetspeech.layer2,
-            resnetspeech.layer3,
-        )
-        self.fusion_conv = nn.Sequential(
-            nn.Conv2d(512, 256, kernel_size=1, bias=False),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-        )
-        self.layer4  = resnetcough.layer4
-        self.avgpool = resnetcough.avgpool
-        self.fc      = nn.Linear(512, num_classes)
-
-    def forward(self, stream1, stream2):
-        c_feat = self.cough_base(stream1)
-        s_feat = self.speech_base(stream2)
-        fused  = torch.cat((c_feat, s_feat), dim=1)
-        fused  = self.fusion_conv(fused)
-        out    = self.layer4(fused)
-        out    = self.avgpool(out)
-        out    = torch.flatten(out, 1)
-        out    = self.fc(out)
-        return out
-
+# ======================================================================
+# TRAIN / EVAL
+# ======================================================================
 
 def train_validate(train_data, dev_data, test_data, model, params):
-    """
-    Training with early stopping on validation loss.
-    Returns per-epoch history list of dicts and restores best weights.
-    """
+    """Training with early stopping on development-fold AUC (smoothed)."""
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=params["learning_rate"],
         weight_decay=params["weight_decay"],
     )
 
-    # ---- class weights (per-cough, from training fold) ----
+    # ---- class weights (per-cough, from the fold pair's training set) ----
     train_labels = []
     for batch in train_data:
         labels = batch[2] if len(batch) == 4 else batch[1]
         train_labels.append(labels)
     train_labels = torch.cat(train_labels).long()
     class_counts = torch.bincount(train_labels, minlength=2)
-    class_counts = torch.clamp(class_counts, min=1)          # guard absent class
+    class_counts = torch.clamp(class_counts, min=1)
     weights = class_counts.sum() / (2 * class_counts.float())
     weights = weights.to(device)
 
     criterion = torch.nn.CrossEntropyLoss(weight=weights)
 
-    # ---- early stopping ----
-    patience  = params.get("early_stop_patience", 7)
-    min_delta = params.get("early_stop_min_delta", 1e-4)
-    stopper   = EarlyStopper(patience=patience, min_delta=min_delta, mode="min")
+    # ---- early stopping (select on dev AUC) ----
+    patience   = params.get("early_stop_patience", 7)
+    min_delta  = params.get("early_stop_min_delta", 1e-3)
+    min_epochs = params.get("early_stop_min_epochs", 10)
+    stopper    = EarlyStopper(patience=patience, min_delta=min_delta,
+                              mode="max", window=3, min_epochs=min_epochs)
 
     dev_fold  = params.get("dev_set")
     test_fold = params.get("test_set")
 
     history = []
 
-    # ---- header (once per fold) ----
     print(
         f"\n{'=' * 120}\n"
         f"Fold: test={test_fold}  dev={dev_fold}  "
         f"fusion={params.get('fusion', '?')}  arch={params.get('arch', '?')}  "
-        f"aug={params.get('augmentation', '?')}  patience={patience}\n"
+        f"pretrained={params.get('use_pretrained', '?')}  "
+        f"aug={params.get('augmentation', '?')}  "
+        f"patience={patience}  min_epochs={min_epochs}\n"
         f"{'-' * 120}\n"
-        f"{'ep':>4} | {'tr_loss_cough':>13} | "
-        f"{'dev_loss_pat':>12} {'dev_loss_cough':>14} {'dev_acc':>8} {'dev_auc':>8} | "
-        f"{'test_loss_pat':>13} {'test_loss_cough':>15} {'test_acc':>9} {'test_auc':>9} | notes\n"
+        f"{'ep':>4} | {'tr_loss':>10} | "
+        f"{'dev_loss':>10} {'dev_acc':>8} {'dev_auc':>8} | "
+        f"{'test_loss':>10} {'test_acc':>9} {'test_auc':>9} | notes\n"
         f"{'-' * 120}"
     )
 
@@ -286,11 +190,11 @@ def train_validate(train_data, dev_data, test_data, model, params):
                 test_data, model, criterion, set_name="test", verbose=False
             )
 
-        # ---- early-stopping step ----
+        # ---- early-stopping step on dev AUC ----
         if dev_data is not None:
-            is_best = stopper.step(dev_loss_pat, model, epoch)
+            is_best = stopper.step(dev_auc, model, epoch)
         else:
-            is_best = stopper.step(train_loss, model, epoch)
+            is_best = False
 
         history.append({
             "epoch":             epoch + 1,
@@ -306,7 +210,6 @@ def train_validate(train_data, dev_data, test_data, model, params):
             "is_best":           int(is_best),
         })
 
-        # ---- terminal row ----
         note = ""
         if is_best:
             note += " *best*"
@@ -314,21 +217,19 @@ def train_validate(train_data, dev_data, test_data, model, params):
             note += " [STOP]"
 
         print(
-            f"{epoch + 1:>4} | {train_loss:>13.4f} | "
-            f"{dev_loss_pat:>12.4f} {dev_loss_cough:>14.4f} "
-            f"{dev_acc:>8.4f} {dev_auc:>8.4f} | "
-            f"{test_loss_pat:>13.4f} {test_loss_cough:>15.4f} "
-            f"{test_acc:>9.4f} {test_auc:>9.4f} |{note}"
+            f"{epoch + 1:>4} | {train_loss:>10.4f} | "
+            f"{dev_loss_pat:>10.4f} {dev_acc:>8.4f} {dev_auc:>8.4f} | "
+            f"{test_loss_pat:>10.4f} {test_acc:>9.4f} {test_auc:>9.4f} |{note}"
         )
 
         if stopper.should_stop:
             print(
-                f"[EARLY STOP] epoch {epoch + 1}: no dev-loss improvement "
-                f"for {patience} epochs. Best epoch = {stopper.best_epoch + 1}."
+                f"[EARLY STOP] epoch {epoch + 1}: no dev-AUC improvement "
+                f"for {patience} epochs (min_epochs={min_epochs}). "
+                f"Best epoch = {stopper.best_epoch + 1}."
             )
             break
 
-    # ---- restore best weights and print final summary ----
     if dev_data is not None:
         stopper.restore_best(model)
         print(f"\n[FINAL] restored best epoch = {stopper.best_epoch + 1}")
@@ -374,18 +275,9 @@ def train_epoch(train_data, model, optimizer, criterion):
 
 
 def evaluate_epoch(dev_data, model, criterion, set_name="eval", verbose=True):
-    """
-    Patient-level evaluation.
-
-    Forward pass per cough -> collect logits -> average logits per patient
-    (Bayesian pooling) -> compute per-patient loss, accuracy, AUC.
-
-    Also returns the per-cough loss (same definition as in train_epoch)
-    so you can spot divergence between cough- and patient-level behavior.
-
-    Supports 2-tuple, 3-tuple, and 4-tuple (late fusion) batches.
-    Returns: (patient_loss, acc, auc, cough_loss)
-    """
+    """Patient-level evaluation. Aggregates logits per patient, then applies
+    softmax to obtain per-patient probabilities. Returns:
+    (patient_loss, acc, auc, cough_loss)."""
     model.eval()
 
     cumulative_cough_loss, total_coughs = 0.0, 0
@@ -394,7 +286,6 @@ def evaluate_epoch(dev_data, model, criterion, set_name="eval", verbose=True):
 
     with torch.no_grad():
         for batch in dev_data:
-            # ---------- forward pass ----------
             if len(batch) == 4:
                 cough_data, speech_data, labels, pids = batch
                 cough_data  = cough_data.to(torch.float32).to(device)
@@ -416,12 +307,10 @@ def evaluate_epoch(dev_data, model, criterion, set_name="eval", verbose=True):
                 logits     = model(input_data)
                 batch_size = input_data.size(0)
 
-            # ---------- per-cough loss (reference only) ----------
             cough_loss = criterion(logits, labels.long())
             cumulative_cough_loss += cough_loss.item() * batch_size
             total_coughs          += batch_size
 
-            # ---------- group logits by patient ----------
             logits_cpu = logits.detach().cpu()
             if pids is not None:
                 for i, pid in enumerate(pids):
@@ -434,21 +323,17 @@ def evaluate_epoch(dev_data, model, criterion, set_name="eval", verbose=True):
                     patient_logits.setdefault(key, []).append(logits_cpu[i])
                     patient_labels.setdefault(key, labels[i].item())
 
-    # ---------- aggregate per patient in LOGIT space ----------
     agg_logits, agg_labels = [], []
     for pid, logits_list in patient_logits.items():
-        mean_logit = torch.stack(logits_list).mean(0)   # [C]  (CPU)
+        mean_logit = torch.stack(logits_list).mean(0)
         agg_logits.append(mean_logit)
         agg_labels.append(patient_labels[pid])
 
-    # move to device so we can reuse the CUDA-resident class weights
-    agg_logits = torch.stack(agg_logits).to(device)                 # [N_patients, C]
-    agg_labels = torch.tensor(agg_labels).long().to(device)         # [N_patients]
+    agg_logits = torch.stack(agg_logits).to(device)
+    agg_labels = torch.tensor(agg_labels).long().to(device)
 
-    # ---------- per-patient loss ----------
     patient_loss = criterion(agg_logits, agg_labels).item()
 
-    # ---------- per-patient accuracy / AUC (CPU for sklearn) ----------
     agg_probs_cpu  = torch.softmax(agg_logits, dim=1)[:, 1].detach().cpu()
     agg_labels_cpu = agg_labels.detach().cpu()
 
