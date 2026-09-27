@@ -96,23 +96,18 @@ class ResNet18(nn.Module):
         weights = ResNet18_Weights.IMAGENET1K_V1 if use_pretrained else None
         self.resnet = resnet18(weights=weights)
 
-        if use_pretrained:
-            # Transfer learning: freeze the whole backbone...
-            for p in self.resnet.parameters():
-                p.requires_grad = False
-        else:
-            # From scratch: everything trainable.
-            for p in self.resnet.parameters():
-                p.requires_grad = True
+        for p in self.resnet.parameters():
+            p.requires_grad = False
+        for name, param in self.resnet.parameters():
+            if 'layer4' in name or 'fc' in name:
+                param.requires_grad = True
 
-        # Replace the classifier head.
         self.resnet.fc = nn.Sequential(
             nn.Dropout(p=dropout_p),
             nn.Linear(512, num_classes),
         )
 
         if use_pretrained:
-            # ...then unfreeze only the final residual block.
             for p in self.resnet.layer4.parameters():
                 p.requires_grad = True
 
@@ -120,19 +115,20 @@ class ResNet18(nn.Module):
         return self.resnet(x)
 
 
-# ======================================================================
-# TRAIN / EVAL
-# ======================================================================
-
 def train_validate(train_data, dev_data, test_data, model, params):
-    """Training with early stopping on development-fold AUC (smoothed)."""
+    """Standard protocol:
+        - dev AUC evaluated every epoch, used for early stopping and best-
+          checkpoint selection
+        - test AUC evaluated EXACTLY ONCE, after restoring the best-dev
+          checkpoint
+    """
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=params["learning_rate"],
         weight_decay=params["weight_decay"],
     )
 
-    # ---- class weights (per-cough, from the fold pair's training set) ----
+    # ---- class weights (from training set) ----
     train_labels = []
     for batch in train_data:
         labels = batch[2] if len(batch) == 4 else batch[1]
@@ -142,20 +138,22 @@ def train_validate(train_data, dev_data, test_data, model, params):
     class_counts = torch.clamp(class_counts, min=1)
     weights = class_counts.sum() / (2 * class_counts.float())
     weights = weights.to(device)
-
     criterion = torch.nn.CrossEntropyLoss(weight=weights)
 
-    # ---- early stopping (select on dev AUC) ----
+    # ---- early stopping (dev AUC) ----
     patience   = params.get("early_stop_patience", 7)
-    min_delta  = params.get("early_stop_min_delta", 1e-3)
+    min_delta  = params.get("early_stop_min_delta", 5e-3)   # default raised
     min_epochs = params.get("early_stop_min_epochs", 10)
+    window     = params.get("early_stop_window", 5)          # NEW: configurable
     stopper    = EarlyStopper(patience=patience, min_delta=min_delta,
-                              mode="max", window=3, min_epochs=min_epochs)
+                              mode="max", window=window, min_epochs=min_epochs)
 
     dev_fold  = params.get("dev_set")
     test_fold = params.get("test_set")
 
     history = []
+    best_epoch = None
+    final_test_metrics = None
 
     print(
         f"\n{'=' * 120}\n"
@@ -163,37 +161,26 @@ def train_validate(train_data, dev_data, test_data, model, params):
         f"fusion={params.get('fusion', '?')}  arch={params.get('arch', '?')}  "
         f"pretrained={params.get('use_pretrained', '?')}  "
         f"aug={params.get('augmentation', '?')}  "
-        f"patience={patience}  min_epochs={min_epochs}\n"
+        f"patience={patience}  min_epochs={min_epochs}  "
+        f"window={window}  min_delta={min_delta}\n"           # NEW: log it
         f"{'-' * 120}\n"
         f"{'ep':>4} | {'tr_loss':>10} | "
-        f"{'dev_loss':>10} {'dev_acc':>8} {'dev_auc':>8} | "
-        f"{'test_loss':>10} {'test_acc':>9} {'test_auc':>9} | notes\n"
+        f"{'dev_loss':>10} {'dev_acc':>8} {'dev_auc':>8} | notes\n"
         f"{'-' * 120}"
     )
 
     for epoch in range(params["num_epochs"]):
         train_loss = train_epoch(train_data, model, optimizer, criterion)
 
-        dev_loss_pat, dev_acc, dev_auc, dev_loss_cough = (
-            float("inf"), 0.0, float("nan"), float("inf")
-        )
+        # ---- dev evaluation ONLY (test is not touched here) ----
         if dev_data is not None:
             dev_loss_pat, dev_acc, dev_auc, dev_loss_cough = evaluate_epoch(
                 dev_data, model, criterion, set_name="dev", verbose=False
             )
-
-        test_loss_pat, test_acc, test_auc, test_loss_cough = (
-            float("inf"), 0.0, float("nan"), float("inf")
-        )
-        if test_data is not None:
-            test_loss_pat, test_acc, test_auc, test_loss_cough = evaluate_epoch(
-                test_data, model, criterion, set_name="test", verbose=False
-            )
-
-        # ---- early-stopping step on dev AUC ----
-        if dev_data is not None:
             is_best = stopper.step(dev_auc, model, epoch)
         else:
+            dev_loss_pat = dev_loss_cough = float("inf")
+            dev_acc, dev_auc = 0.0, float("nan")
             is_best = False
 
         history.append({
@@ -203,39 +190,48 @@ def train_validate(train_data, dev_data, test_data, model, params):
             "dev_loss_cough":    dev_loss_cough,
             "dev_acc":           dev_acc,
             "dev_auc":           dev_auc,
-            "test_loss_patient": test_loss_pat,
-            "test_loss_cough":   test_loss_cough,
-            "test_acc":          test_acc,
-            "test_auc":          test_auc,
+            "test_loss_patient": float("nan"),
+            "test_loss_cough":   float("nan"),
+            "test_acc":          float("nan"),
+            "test_auc":          float("nan"),
             "is_best":           int(is_best),
         })
 
-        note = ""
-        if is_best:
-            note += " *best*"
+        note = " *best*" if is_best else ""
         if stopper.should_stop:
             note += " [STOP]"
-
-        print(
-            f"{epoch + 1:>4} | {train_loss:>10.4f} | "
-            f"{dev_loss_pat:>10.4f} {dev_acc:>8.4f} {dev_auc:>8.4f} | "
-            f"{test_loss_pat:>10.4f} {test_acc:>9.4f} {test_auc:>9.4f} |{note}"
-        )
+        print(f"{epoch + 1:>4} | {train_loss:>10.4f} | "
+              f"{dev_loss_pat:>10.4f} {dev_acc:>8.4f} {dev_auc:>8.4f} |{note}")
 
         if stopper.should_stop:
-            print(
-                f"[EARLY STOP] epoch {epoch + 1}: no dev-AUC improvement "
-                f"for {patience} epochs (min_epochs={min_epochs}). "
-                f"Best epoch = {stopper.best_epoch + 1}."
-            )
+            print(f"[EARLY STOP] epoch {epoch + 1}: no dev-AUC improvement "
+                  f"for {patience} epochs (min_epochs={min_epochs}). "
+                  f"Best epoch = {stopper.best_epoch + 1}.")
             break
 
-    if dev_data is not None:
+    # ---- restore best-dev checkpoint, evaluate test exactly once ----
+    if dev_data is not None and stopper.best_state is not None:
         stopper.restore_best(model)
-        print(f"\n[FINAL] restored best epoch = {stopper.best_epoch + 1}")
-        evaluate_epoch(dev_data, model, criterion, set_name="dev_best", verbose=True)
+        best_epoch = stopper.best_epoch + 1
+        print(f"\n[FINAL] restored best epoch = {best_epoch}")
+        evaluate_epoch(dev_data, model, criterion,
+                       set_name="dev_best", verbose=True)
+
         if test_data is not None:
-            evaluate_epoch(test_data, model, criterion, set_name="test_best", verbose=True)
+            tl_pat, ta, t_auc, tl_cough = evaluate_epoch(
+                test_data, model, criterion, set_name="test_best", verbose=True
+            )
+            final_test_metrics = {
+                "test_loss_patient": tl_pat,
+                "test_loss_cough":   tl_cough,
+                "test_acc":          ta,
+                "test_auc":          t_auc,
+            }
+
+        # Attach the single test result to the chosen-epoch row only.
+        for h in history:
+            if h["epoch"] == best_epoch and final_test_metrics:
+                h.update(final_test_metrics)
 
     return history
 

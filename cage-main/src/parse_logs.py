@@ -1,182 +1,105 @@
-from pathlib import Path
+# ------------------------------------------------------------------
+# report.py
+#
+# Honest aggregation of the per-fold CSVs produced by main.py.
+#
+# main.py writes one row per (test_set, dev_set, epoch). The test_auc
+# column is non-NaN on exactly one epoch per (test_set, dev_set) pair.
+# So a completed run has 10 test folds x 9 dev folds = 90 non-NaN
+# test_auc values.
+#
+# Those 90 values are NOT independent: the 9 dev-fold runs that share
+# a test fold all test on the same patients. Reporting mean +/- std
+# over all 90 understates the true std and mis-states what the mean is.
+#
+# This script:
+#   1. collapses the 9 dev-fold runs within each test fold into a
+#      single per-test-fold mean;
+#   2. reports the mean +/- std over the 10 per-test-fold means;
+#   3. also prints a 95% CI on that mean;
+#   4. prints the old (naive 90-row) aggregation for comparison.
+#
+# Usage:
+#   python report.py results/your_file.csv [results/other_file.csv ...]
+# ------------------------------------------------------------------
+import argparse
+import sys
 
-import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 
 
-def process_csv_log(csv_path: Path):
-    """Parses metrics from a CSV log file and saves per-combo and mean plots."""
-    if not csv_path.exists():
-        print(f"Error: CSV log file not found at {csv_path}")
-        return
+def summarise(csv_path):
+    try:
+        df = pd.read_csv(csv_path)
+    except FileNotFoundError:
+        print(f"[{csv_path}] file not found", file=sys.stderr)
+        return None
 
-    output_dir = csv_path.parent / csv_path.stem
-    output_dir.mkdir(parents=True, exist_ok=True)
+    required = {"test_set", "dev_set", "test_auc"}
+    if not required.issubset(df.columns):
+        print(f"[{csv_path}] missing columns {required - set(df.columns)}",
+              file=sys.stderr)
+        return None
 
-    df = pd.read_csv(csv_path)
+    # Only the rows where a test AUC was actually recorded.
+    test_rows = df.dropna(subset=["test_auc"]).copy()
+    if test_rows.empty:
+        print(f"[{csv_path}] no non-NaN test_auc rows — did training finish?",
+              file=sys.stderr)
+        return None
 
-    required_cols = {
-        "test_set",
-        "dev_set",
-        "epoch",
-        "train_loss",
-        "dev_loss",
-        "test_loss",
-        "dev_acc",
-        "dev_auc",
-        "test_acc",
-        "test_auc",
-    }
-    missing = required_cols - set(df.columns)
-    if missing:
-        print(
-            f"Error: Missing columns in {csv_path.name}: {sorted(missing)}. "
-            f"Found columns: {list(df.columns)}"
-        )
-        return
-
-    print(f"Processing CSV log: {csv_path.name}")
-
-    # Collapse duplicated runs of the same (test_set, dev_set, epoch) by averaging.
-    df = (
-        df.groupby(["test_set", "dev_set", "epoch"], as_index=False)
-        .agg(
-            train_loss=("train_loss", "mean"),
-            dev_loss=("dev_loss", "mean"),
-            test_loss=("test_loss", "mean"),
-            dev_acc=("dev_acc", "mean"),
-            dev_auc=("dev_auc", "mean"),
-            test_acc=("test_acc", "mean"),
-            test_auc=("test_auc", "mean"),
-        )
+    # ---- Step 1: collapse dev folds within each test fold ----
+    per_test_fold = (
+        test_rows
+        .groupby("test_set")["test_auc"]
+        .agg(mean_auc="mean", std_auc="std", n_dev_folds="count")
+        .sort_index()
     )
 
-    # ----- Per (test_set, dev_set) plots -----
-    for test_fold, test_df in df.groupby("test_set"):
-        test_dir = output_dir / f"Test_Fold_{test_fold}"
-        test_dir.mkdir(exist_ok=True)
+    print(f"\n=== {csv_path} ===")
+    print(f"non-NaN test_auc rows: {len(test_rows)} "
+          f"({per_test_fold['n_dev_folds'].sum()} across "
+          f"{len(per_test_fold)} test folds)")
+    print("\nPer-test-fold summary (mean over dev folds):")
+    print(per_test_fold.round(4).to_string())
 
-        for dev_fold, dev_df in test_df.groupby("dev_set"):
-            dev_df = dev_df.sort_values("epoch")
+    # ---- Step 2: headline = mean +/- std over the 10 test-fold means ----
+    test_means = per_test_fold["mean_auc"].values
+    n_test     = len(test_means)
 
-            # ---- Loss curves ----
-            plt.figure(figsize=(8, 5))
-            plt.plot(
-                dev_df["epoch"],
-                dev_df["train_loss"],
-                marker="o",
-                linewidth=2,
-                label="Train Loss",
-            )
-            plt.plot(
-                dev_df["epoch"],
-                dev_df["dev_loss"],
-                marker="s",
-                linewidth=2,
-                label="Dev Loss",
-            )
-            plt.plot(
-                dev_df["epoch"],
-                dev_df["test_loss"],
-                marker="^",
-                linewidth=2,
-                label="Test Loss",
-            )
-            plt.title(f"Loss Curves | Test Fold {test_fold} - Dev Fold {dev_fold}")
-            plt.xlabel("Epoch")
-            plt.ylabel("Loss")
-            plt.grid(True, linestyle="--", alpha=0.6)
-            plt.legend()
-            plt.tight_layout()
-            plt.savefig(
-                test_dir / f"loss_test{test_fold}_dev{dev_fold}.png", dpi=300
-            )
-            plt.close()
+    if n_test < 2:
+        print(f"\nOnly {n_test} test fold(s) present — cannot compute a std.")
+        return float(test_means[0])
 
-            # ---- AUC curves ----
-            plt.figure(figsize=(8, 5))
-            plt.plot(
-                dev_df["epoch"],
-                dev_df["dev_auc"],
-                marker="o",
-                linewidth=2,
-                label="Dev AUC",
-                color="#ff7f0e",
-            )
-            plt.plot(
-                dev_df["epoch"],
-                dev_df["test_auc"],
-                marker="s",
-                linewidth=2,
-                label="Test AUC",
-                color="#2ca02c",
-            )
-            plt.title(f"AUC Curves | Test Fold {test_fold} - Dev Fold {dev_fold}")
-            plt.xlabel("Epoch")
-            plt.ylabel("AUC")
-            plt.ylim(0.0, 1.05)
-            plt.grid(True, linestyle="--", alpha=0.6)
-            plt.legend()
-            plt.tight_layout()
-            plt.savefig(
-                test_dir / f"auc_test{test_fold}_dev{dev_fold}.png", dpi=300
-            )
-            plt.close()
+    headline_mean = float(test_means.mean())
+    headline_std  = float(test_means.std(ddof=1))   # sample std across test folds
+    ci95          = 1.96 * headline_std / np.sqrt(n_test)
 
-        # ---- Mean AUC across dev folds for this test fold ----
-        mean_df = (
-            test_df.groupby("epoch", as_index=False)
-            .agg(dev_auc=("dev_auc", "mean"), test_auc=("test_auc", "mean"))
-            .sort_values("epoch")
-        )
+    print(f"\nHeadline test AUC: {headline_mean:.4f} ± {headline_std:.4f} "
+          f"(n = {n_test} test folds)")
+    print(f"95% CI on the mean: "
+          f"[{headline_mean - ci95:.4f}, {headline_mean + ci95:.4f}]")
 
-        plt.figure(figsize=(8, 5))
-        plt.plot(
-            mean_df["epoch"],
-            mean_df["dev_auc"],
-            marker="o",
-            linewidth=2,
-            label="Mean Dev AUC",
-            color="#ff7f0e",
-        )
-        plt.plot(
-            mean_df["epoch"],
-            mean_df["test_auc"],
-            marker="s",
-            linewidth=2,
-            label="Mean Test AUC",
-            color="#2ca02c",
-        )
-        plt.title(f"Mean AUC Across Dev Folds | Test Fold {test_fold}")
-        plt.xlabel("Epoch")
-        plt.ylabel("Mean AUC")
-        plt.ylim(0.0, 1.05)
-        plt.grid(True, linestyle="--", alpha=0.6)
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(
-            test_dir / f"mean_auc_test_fold_{test_fold}.png", dpi=300
-        )
-        plt.close()
+    # ---- Old aggregation, for comparison ----
+    naive_mean = float(test_rows["test_auc"].mean())
+    naive_std  = float(test_rows["test_auc"].std(ddof=1))
+    print(f"\n(for comparison, naive {len(test_rows)}-row aggregation: "
+          f"{naive_mean:.4f} ± {naive_std:.4f})")
 
-    # ----- Overall summary across the entire CSV -----
-    mean_metrics = df[["dev_acc", "dev_auc", "test_acc", "test_auc"]].mean()
-    print(f"\n--- Summary Metrics ({csv_path.name}) ---")
-    print(f"Mean Dev Acc:  {mean_metrics['dev_acc']:.4f}")
-    print(f"Mean Dev AUC:  {mean_metrics['dev_auc']:.4f}")
-    print(f"Mean Test Acc: {mean_metrics['test_acc']:.4f}")
-    print(f"Mean Test AUC: {mean_metrics['test_auc']:.4f}")
-    print(f"Plots saved to directory: '{output_dir}'\n")
+    return headline_mean
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Honest AUC aggregation over main.py CSVs.")
+    ap.add_argument("csv", nargs="+",
+                    help="one or more CSV files produced by main.py")
+    args = ap.parse_args()
+
+    for path in args.csv:
+        summarise(path)
 
 
 if __name__ == "__main__":
-    script_dir = Path(__file__).resolve().parent
-    logs_dir = script_dir.parent / "logs"
-
-    csv_files = sorted(logs_dir.glob("*.csv"))
-
-    if not csv_files:
-        print(f"No CSV files found in directory: {logs_dir}")
-    else:
-        for csv_file in csv_files:
-            process_csv_log(csv_file)
+    main()

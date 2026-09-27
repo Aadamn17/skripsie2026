@@ -57,10 +57,11 @@ class CoughDatasetCleaned(Dataset):
         3. Min-max rescale to [0, 1] using bounds from the padded image
         4. Augment (training only)
         5. Repeat to 3 channels
-        6. ImageNet channel normalisation
+        6. ImageNet channel normalisation  -- only when `pretrained=True`
     """
     def __init__(self, dataset, annotations_file, dir, loss,
-                 fusion_type, is_train=False, augmentation="none"):
+                 fusion_type, is_train=False, augmentation="none",
+                 pretrained=False):
         self.labels = pd.read_csv(annotations_file)
         self.labels["patient_id"] = self.labels["Cough_ID"].astype(str).apply(
             lambda x: x.split("/")[0]
@@ -71,6 +72,7 @@ class CoughDatasetCleaned(Dataset):
         self.fusion_type  = fusion_type
         self.is_train     = is_train
         self.augmentation = augmentation
+        self.pretrained   = pretrained
 
     def __len__(self):
         return len(self.labels)
@@ -116,14 +118,15 @@ class CoughDatasetCleaned(Dataset):
             if self.is_train and self.augmentation != "none":
                 image = apply_augmentation(image, self.augmentation)
             image = image.unsqueeze(0).repeat(3, 1, 1)          # [3, 224, 224]
+            
             image = TF.normalize(image,
-                                 mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225])
+                                     mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225])
             return image, label, pid
 
 
 def get_data(dataset, data_folds, i, j, cough_dir, loss, batch_size,
-             num_outer_folds=10, augmentation="none"):
+             num_outer_folds=10, augmentation="none", pretrained=False):
     train_set_files = [data_folds + f"/fold_{k}" for k in range(num_outer_folds)
                        if k != j and k != i]
     dev_set_file  = data_folds + f"/fold_{j}"
@@ -131,14 +134,17 @@ def get_data(dataset, data_folds, i, j, cough_dir, loss, batch_size,
 
     train_data_set = ConcatDataset([
         CoughDatasetCleaned(dataset, file + ".csv", cough_dir, loss,
-                            "none", is_train=True, augmentation=augmentation)
+                            "none", is_train=True, augmentation=augmentation,
+                            pretrained=pretrained)
         for file in train_set_files
     ])
     val_ds = CoughDatasetCleaned(dataset, dev_set_file + ".csv", cough_dir, loss,
-                                 "none", is_train=False, augmentation=augmentation) \
+                                 "none", is_train=False, augmentation=augmentation,
+                                 pretrained=pretrained) \
         if j is not None else None
     test_ds = CoughDatasetCleaned(dataset, test_set_file + ".csv", cough_dir, loss,
-                                  "none", is_train=False, augmentation=augmentation) \
+                                  "none", is_train=False, augmentation=augmentation,
+                                  pretrained=pretrained) \
         if i is not None else None
 
     def collate(batch):
@@ -171,9 +177,12 @@ class EarlyFusionFlatDataset(Dataset):
     Speech is NOT augmented because it is a broadcast of a single spectral
     vector (rank-1 tensor); masking its time axis would be a no-op or create
     a spurious time-varying signal.
+
+    ImageNet channel normalisation is applied ONLY when `pretrained=True`.
     """
     def __init__(self, annotations_file, cough_dir, speech_dir,
-                 arch, is_train=False, augmentation="none"):
+                 arch, is_train=False, augmentation="none",
+                 pretrained=False):
         self.df = pd.read_csv(annotations_file)
         self.df['patient_id'] = self.df['Cough_ID'].astype(str).apply(
             lambda x: x.split('/')[0]
@@ -201,6 +210,7 @@ class EarlyFusionFlatDataset(Dataset):
         self.speech_dir   = speech_dir
         self.is_train     = is_train
         self.augmentation = augmentation
+        self.pretrained   = pretrained
 
     def __len__(self):
         return len(self.samples)
@@ -248,17 +258,19 @@ class EarlyFusionFlatDataset(Dataset):
             if self.is_train and self.augmentation != "none":
                 c_scaled = apply_augmentation(c_scaled, self.augmentation)
 
-            # ----- Speech pipeline (no augmentation) -----
+            # ----- Speech pipeline -----
             m_speech = self._mean_speech_image(pid)               # [128, 43]
             m_speech = self._pad_to_224(m_speech)                 # [224, 224]
-
+            s_min, s_max = m_speech.min(), m_speech.max()
+            m_speech = (m_speech - s_min) / (s_max - s_min + 1e-8)  # [0, 1]
             # ----- Fuse -----
             fused = torch.stack([c_scaled, c_scaled, m_speech], dim=0)
-            fused = TF.normalize(fused,
-                                 mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225])
+            if self.pretrained:
+                fused = TF.normalize(fused,
+                                     mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225])
 
-        elif self.arch == "lr":
+        '''elif self.arch == "lr":
             # Logistic-regression variant: bilinear-resize cough to 224x224,
             # flatten both streams, concatenate.
             c_4d = c_raw.unsqueeze(0).unsqueeze(0)                # [1, 1, 128, 43]
@@ -271,13 +283,14 @@ class EarlyFusionFlatDataset(Dataset):
 
             c_flat = torch.flatten(c_resized)                     # [50176]
             m_flat = torch.flatten(m_speech)                      # [50176]
-            fused  = torch.cat([c_flat, m_flat], dim=0)           # [100352]
+            fused  = torch.cat([c_flat, m_flat], dim=0)   '''        # [100352]
 
         return fused, label, pid
 
 
 def get_early_fusion_data(dataset, data_folds, i, j, cough_dir, speech_dir, loss,
-                          batch_size, arch, num_outer_folds=10, augmentation="none"):
+                          batch_size, arch, num_outer_folds=10, augmentation="none",
+                          pretrained=False):
     train_folds_noext = [data_folds + f"/fold_{k}" for k in range(num_outer_folds)
                          if k != j and k != i]
     train_folds_csv = [f + ".csv" for f in train_folds_noext]
@@ -286,14 +299,17 @@ def get_early_fusion_data(dataset, data_folds, i, j, cough_dir, speech_dir, loss
 
     train_ds = ConcatDataset([
         EarlyFusionFlatDataset(f, cough_dir, speech_dir, arch,
-                               is_train=True, augmentation=augmentation)
+                               is_train=True, augmentation=augmentation,
+                               pretrained=pretrained)
         for f in train_folds_csv
     ])
     val_ds = EarlyFusionFlatDataset(dev_file, cough_dir, speech_dir, arch,
-                                    is_train=False, augmentation=augmentation) \
+                                    is_train=False, augmentation=augmentation,
+                                    pretrained=pretrained) \
         if j is not None else None
     test_ds = EarlyFusionFlatDataset(test_file, cough_dir, speech_dir, arch,
-                                     is_train=False, augmentation=augmentation) \
+                                     is_train=False, augmentation=augmentation,
+                                     pretrained=pretrained) \
         if i is not None else None
 
     def collate(batch):
