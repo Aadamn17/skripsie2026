@@ -3,9 +3,14 @@ Visualise cough and speech spectrograms from the CAGE-TB dataset.
 
 Usage
 -----
+    # Single patient
     python3 view_spectrograms.py CAGE0048
     python3 view_spectrograms.py CAGE0048 --max 5
-    python3 view_spectrograms.py CAGE0048 --outdir "raw spectrograms"
+
+    # Every patient
+    python3 view_spectrograms.py --all
+    python3 view_spectrograms.py --all --max 3
+    python3 view_spectrograms.py --all --outdir "raw spectrograms"
 
 By default, figures are saved to:
     <outdir>/<patient_id>/raw.png
@@ -61,7 +66,7 @@ def pad_to_224(img):
 
 def preprocess_cough(cough_path):
     """Return the four pipeline stages for one cough."""
-    raw      = torch.tensor(np.load(cough_path), dtype=torch.float32)  # [128, 43]
+    raw      = torch.tensor(np.load(cough_path), dtype=torch.float32)   # [128, 43]
     padded   = pad_to_224(raw)                                          # [224, 224]
     c_min, c_max = padded.min(), padded.max()
     scaled   = (padded - c_min) / (c_max - c_min + 1e-8)                # [0, 1]
@@ -106,7 +111,7 @@ def figure_raw(pid, max_show):
     speech = speech[:max_show]
 
     if not coughs and not speech:
-        print(f"No files found for patient {pid} in {COUGH_DIR} or {SPEECH_DIR}.")
+        print(f"  No files found for patient {pid} in {COUGH_DIR} or {SPEECH_DIR}.")
         return None
 
     n = max(len(coughs), len(speech), 1)
@@ -139,7 +144,7 @@ def figure_pipeline(pid):
     cough_dir = os.path.join(COUGH_DIR, pid)
     coughs = sorted(Path(cough_dir).glob("*.npy")) if os.path.isdir(cough_dir) else []
     if not coughs:
-        print(f"No cough files for {pid}; skipping pipeline figure.")
+        print(f"  No cough files for {pid}; skipping pipeline figure.")
         return None
 
     raw, padded, scaled, normalized = preprocess_cough(coughs[0])
@@ -186,41 +191,81 @@ def figure_pipeline(pid):
 
 
 # ----------------------------------------------------------------------
-# CLI
+# Per-patient worker
 # ----------------------------------------------------------------------
-def main():
-    parser = argparse.ArgumentParser(
-        description="Visualise cough and speech spectrograms for one patient.",
-    )
-    parser.add_argument("patient_id", type=str,
-                        help="Patient ID, e.g. CAGE0048")
-    parser.add_argument("--max", type=int, default=5,
-                        help="Max number of coughs and speech files to show "
-                             "(default: 5)")
-    parser.add_argument("--outdir", type=str, default="raw spectrograms",
-                        help="Root output directory; a subdirectory named "
-                             "after the patient ID is created inside it "
-                             "(default: 'raw spectrograms')")
-    args = parser.parse_args()
-
-    # Create <outdir>/<patient_id>/
-    save_dir = os.path.join(args.outdir, args.patient_id)
+def process_patient(pid, max_show, outdir):
+    """Generate and save both figures for one patient."""
+    save_dir = os.path.join(outdir, pid)
     os.makedirs(save_dir, exist_ok=True)
 
-    fig1 = figure_raw(args.patient_id, args.max)
-    fig2 = figure_pipeline(args.patient_id)
+    fig1 = figure_raw(pid, max_show)
+    fig2 = figure_pipeline(pid)
 
     if fig1:
         path = os.path.join(save_dir, "raw.png")
         fig1.savefig(path, dpi=150, bbox_inches="tight")
-        print(f"saved {path}")
         plt.close(fig1)
 
     if fig2:
         path = os.path.join(save_dir, "pipeline.png")
         fig2.savefig(path, dpi=150, bbox_inches="tight")
-        print(f"saved {path}")
         plt.close(fig2)
+
+
+# ----------------------------------------------------------------------
+# CLI
+# ----------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(
+        description="Visualise cough and speech spectrograms for CAGE-TB.",
+    )
+    parser.add_argument("patient_id", type=str, nargs="?", default=None,
+                        help="Patient ID, e.g. CAGE0048. "
+                             "Omit when using --all.")
+    parser.add_argument("--all", action="store_true",
+                        help="Process every patient folder found in "
+                             f"{COUGH_DIR}.")
+    parser.add_argument("--max", type=int, default=5,
+                        help="Max number of coughs and speech files to show "
+                             "per patient (default: 5)")
+    parser.add_argument("--outdir", type=str, default="raw spectrograms",
+                        help="Root output directory; a subdirectory named "
+                             "after each patient ID is created inside it "
+                             "(default: 'raw spectrograms')")
+    args = parser.parse_args()
+
+    if args.all:
+        if not os.path.isdir(COUGH_DIR):
+            print(f"Cough directory not found: {COUGH_DIR}")
+            return
+
+        patient_ids = sorted(
+            d for d in os.listdir(COUGH_DIR)
+            if os.path.isdir(os.path.join(COUGH_DIR, d))
+        )
+
+        if not patient_ids:
+            print(f"No patient folders found in {COUGH_DIR}")
+            return
+
+        print(f"Processing {len(patient_ids)} patients...")
+        for i, pid in enumerate(patient_ids, 1):
+            print(f"[{i}/{len(patient_ids)}] {pid}")
+            try:
+                process_patient(pid, args.max, args.outdir)
+            except Exception as e:
+                print(f"  [ERROR] {pid}: {e}")
+                continue
+
+        print(f"\nDone. Figures saved under: {args.outdir}/")
+
+    else:
+        if args.patient_id is None:
+            parser.error("Provide a patient_id or use --all.")
+        print(f"Processing {args.patient_id}...")
+        process_patient(args.patient_id, args.max, args.outdir)
+        print(f"saved {os.path.join(args.outdir, args.patient_id, 'raw.png')}")
+        print(f"saved {os.path.join(args.outdir, args.patient_id, 'pipeline.png')}")
 
 
 if __name__ == "__main__":
