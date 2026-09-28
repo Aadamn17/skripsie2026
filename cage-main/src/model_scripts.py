@@ -98,9 +98,9 @@ class ResNet18(nn.Module):
 
         for p in self.resnet.parameters():
             p.requires_grad = False
-        for name, param in self.resnet.parameters():
-            if 'layer4' in name or 'fc' in name:
-                param.requires_grad = True
+        for name, p in self.resnet.named_parameters():  
+            if name.startswith("layer4") or name.startswith("fc"):
+                p.requires_grad = True
 
         self.resnet.fc = nn.Sequential(
             nn.Dropout(p=dropout_p),

@@ -327,3 +327,6 @@ def get_early_fusion_data(dataset, data_folds, i, j, cough_dir, speech_dir, loss
                              num_workers=4, drop_last=False, collate_fn=collate) \
         if test_ds else None
     return train_loader, val_loader, test_loader
+
+class LateFusionDataset(Dataset):
+    "Returns two modalities seperately"

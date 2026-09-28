@@ -22,7 +22,7 @@ from torchvision.models import ResNet18_Weights
 grid = {
     'loss_selected': ["cross_entropy_resnet"],
 
-    'test_set': [0],
+    'test_set': [0,1,2,3,4,5,6,7,8,9],
     'dev_set':  [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
     'num_epochs': [50],
     'batch_size': [32],
@@ -31,7 +31,7 @@ grid = {
     'dataset': ["cage"],
     'arch': ["resnet"],
     'fusion': ["early"],
-    'augmentation': ["none","gaussian_noise","solarisation"],
+    'augmentation': ["none","solarisation"],
     'pretrained': [True],
 
     'early_stop_patience':   [5],
