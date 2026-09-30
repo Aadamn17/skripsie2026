@@ -435,3 +435,12 @@ def get_late_fusion_data(dataset, data_folds, i, j, cough_dir, speech_dir,
                              num_workers=4, collate_fn=collate) if test_ds else None
     return train_loader, val_loader, test_loader
 
+'''def get_raw_speech_data(dataset, data_folds, i, j, raw_speech_dir,
+                    batch_size, num_outer_folds=10):
+    """
+    Returns a DataLoader for the raw speech data of the patients in the
+    the raw speech is .wav files, that are to be fed into wav2vec2. The DataLoader returns a batch of (speech [B, 1, T], labels, pids).
+    """
+    train_folds = [data_folds + f"/fold_{k}" for k in range(num_outer_folds)
+                   if k != j and k != i]    
+    '''

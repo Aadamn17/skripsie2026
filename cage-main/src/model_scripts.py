@@ -139,6 +139,13 @@ class EfficientNetB0(nn.Module):
 
     def forward(self, x):
         return self.efficientnet(x)
+class Wav2Vec2(nn.Module):
+    "Wav2vec2 speech encoder, outputs logits that are concatted to the second fusion pipeline"
+    "takes in raw speech audio not spectrograms"
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.num_classes = self.num_classes
+              
 class LateFusion(nn.Module):
     """
     Late fusion at the LOGIT level.

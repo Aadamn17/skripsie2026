@@ -32,7 +32,7 @@ grid = {
     'early_stop_window':     [5],
 }
 
-
+raw_speech_dir = "data/cage/raw_speech"
 cough_dir  = "data/cage/mel_spectrograms_128"
 speech_dir = "data/cage/preprocessed_speech"
 
