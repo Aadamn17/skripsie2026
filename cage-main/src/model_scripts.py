@@ -3,14 +3,10 @@ import torch
 import numpy as np
 from sklearn import metrics
 import torch.nn as nn
-from torchvision.models import resnet18, ResNet18_Weights
+from torchvision.models import resnet18, ResNet18_Weights, efficientnet_b0, EfficientNet_B0_Weights
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
-# ======================================================================
-# EARLY STOPPING
-# ======================================================================
 
 class EarlyStopper:
     """Stops training when the monitored metric hasn't improved for `patience`
@@ -62,12 +58,7 @@ class EarlyStopper:
     def restore_best(self, model):
         if self.best_state is not None:
             model.load_state_dict(self.best_state)
-
-
-# ======================================================================
 # MODELS
-# ======================================================================
-
 class Logistic_Regression(nn.Module):
     """Single linear layer. Used as a baseline and as a low-capacity
     classifier on top of frozen features."""
@@ -114,6 +105,89 @@ class ResNet18(nn.Module):
     def forward(self, x):
         return self.resnet(x)
 
+class EfficientNetB0(nn.Module):
+    """Single-stream EfficientNetB0 with the classification head replaced by
+    Dropout + Linear.
+
+    The freeze policy is coupled to the pretrained-weights choice:
+      * use_pretrained=True  -> freeze all backbone, unfreeze only layer4 + head
+      * use_pretrained=False -> all parameters trainable (train from scratch)
+    """
+    def __init__(self, fusion_type="none", num_classes=2, dropout_p=0.3,
+                 use_pretrained=True):
+        super(EfficientNetB0, self).__init__()
+        self.fusion_type    = fusion_type
+        self.use_pretrained = use_pretrained
+
+        weights = EfficientNet_B0_Weights.IMAGENET1K_V1 if use_pretrained else None
+        self.efficientnet = efficientnet_b0(weights=weights)
+
+        for p in self.efficientnet.parameters():
+            p.requires_grad = False
+        for name, param in self.efficientnet.named_parameters():
+            if 'features.6' in name or 'classifier' in name:
+                param.requires_grad = True
+
+        self.efficientnet.classifier = nn.Sequential(
+            nn.Dropout(p=dropout_p),
+            nn.Linear(1280, num_classes),
+        )
+
+        if use_pretrained:
+            for p in self.efficientnet.features[6].parameters():
+                p.requires_grad = True
+
+    def forward(self, x):
+        return self.efficientnet(x)
+class LateFusion(nn.Module):
+    """
+    Late fusion at the LOGIT level.
+
+        cough  [B, 3, 224, 224] ──► ResNet18 ──► cough_logits  [B, 2]
+        speech [B, 128]         ──► Linear    ──► speech_logits [B, 2]
+                                         concat ──► [B, 4]
+                                         Linear(4, 2) ──► [B, 2]
+
+    The final Linear(4, 2) learns a per-class weighting of the two branches.
+    With 4*2 + 2 = 10 parameters it cannot overfit meaningfully.
+    """
+    def __init__(self, num_classes=2, use_pretrained=True, dropout_p=0.3):
+        super().__init__()
+        weights = ResNet18_Weights.IMAGENET1K_V1 if use_pretrained else None
+        self.cough_backbone = resnet18(weights=weights)
+        self.cough_backbone.fc = nn.Linear(512, num_classes)
+
+        if use_pretrained:
+            for p in self.cough_backbone.parameters():
+                p.requires_grad = False
+            for name, p in self.cough_backbone.named_parameters():
+                if name.startswith("layer4") or name.startswith("fc"):
+                    p.requires_grad = True
+
+        self.speech_lr = Logistic_Regression(input_dim=128,
+                                             num_classes=num_classes)
+
+        self.fusion_head = nn.Linear(2 * num_classes, num_classes)
+
+    def forward(self, cough, speech):
+        cough_logits  = self.cough_backbone(cough)                  # [B, 2]
+        speech_logits = self.speech_lr(speech)                      # [B, 2]
+        fused = torch.cat([cough_logits, speech_logits], dim=1)     # [B, 4]
+        return self.fusion_head(fused)                              # [B, 2]
+
+    def param_groups(self, base_lr, weight_decay):
+        """
+        The speech LR branch converges much faster than the fine-tuned ResNet,
+        so give it a larger learning rate.
+        """
+        return [
+            {"params": self.cough_backbone.parameters(),
+             "lr": base_lr,       "weight_decay": weight_decay},
+            {"params": self.speech_lr.parameters(),
+             "lr": base_lr * 10,  "weight_decay": weight_decay},
+            {"params": self.fusion_head.parameters(),
+             "lr": base_lr,       "weight_decay": weight_decay},
+        ]
 
 def train_validate(train_data, dev_data, test_data, model, params):
     """Standard protocol:
@@ -122,13 +196,16 @@ def train_validate(train_data, dev_data, test_data, model, params):
         - test AUC evaluated EXACTLY ONCE, after restoring the best-dev
           checkpoint
     """
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=params["learning_rate"],
-        weight_decay=params["weight_decay"],
-    )
-
-    # ---- class weights (from training set) ----
+    if hasattr(model, "param_groups"):
+        optimizer = torch.optim.AdamW(
+            model.param_groups(params["learning_rate"], params["weight_decay"]),
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=params["learning_rate"],
+            weight_decay=params["weight_decay"],
+        )
     train_labels = []
     for batch in train_data:
         labels = batch[2] if len(batch) == 4 else batch[1]
@@ -172,7 +249,6 @@ def train_validate(train_data, dev_data, test_data, model, params):
     for epoch in range(params["num_epochs"]):
         train_loss = train_epoch(train_data, model, optimizer, criterion)
 
-        # ---- dev evaluation ONLY (test is not touched here) ----
         if dev_data is not None:
             dev_loss_pat, dev_acc, dev_auc, dev_loss_cough = evaluate_epoch(
                 dev_data, model, criterion, set_name="dev", verbose=False
@@ -208,8 +284,6 @@ def train_validate(train_data, dev_data, test_data, model, params):
                   f"for {patience} epochs (min_epochs={min_epochs}). "
                   f"Best epoch = {stopper.best_epoch + 1}.")
             break
-
-    # ---- restore best-dev checkpoint, evaluate test exactly once ----
     if dev_data is not None and stopper.best_state is not None:
         stopper.restore_best(model)
         best_epoch = stopper.best_epoch + 1

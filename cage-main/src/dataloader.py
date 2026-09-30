@@ -6,9 +6,7 @@ from torch.utils.data import Dataset, DataLoader, ConcatDataset
 import torchvision.transforms.functional as TF
 
 
-# ======================================================================
-# AUGMENTATION FUNCTIONS
-# ======================================================================
+
 
 def gaussian_noise(image, std=0.05):
     """Additive white noise with standard deviation `std`.
@@ -42,9 +40,7 @@ def apply_augmentation(image, aug_type):
         raise ValueError(f"Unknown augmentation: {aug_type}")
 
 
-# ======================================================================
-# SINGLE-MODALITY (COUGH-ONLY) DATASET
-# ======================================================================
+
 
 class CoughDatasetCleaned(Dataset):
     """
@@ -103,7 +99,7 @@ class CoughDatasetCleaned(Dataset):
         pid   = self.labels["patient_id"][idx]
         path  = os.path.join(self.dir, str(self.labels["Cough_ID"][idx]) + ".npy")
 
-        # .npy is stored as [freq, time] = [128, 43]; do NOT transpose.
+        # .npy is stored as [freq, time] = [128, 43]; 
         image_raw = torch.tensor(np.load(path), dtype=torch.float32)
 
         if self.loss == "cross_entropy":
@@ -163,9 +159,7 @@ def get_data(dataset, data_folds, i, j, cough_dir, loss, batch_size,
     return train_data, val_data, test_data
 
 
-# ======================================================================
 # EARLY-FUSION DATASET
-# ======================================================================
 
 class EarlyFusionFlatDataset(Dataset):
     """
@@ -174,11 +168,6 @@ class EarlyFusionFlatDataset(Dataset):
         channel 1: cough (duplicate)
         channel 2: patient-level mean speech (already in [0, 1])
 
-    Speech is NOT augmented because it is a broadcast of a single spectral
-    vector (rank-1 tensor); masking its time axis would be a no-op or create
-    a spurious time-varying signal.
-
-    ImageNet channel normalisation is applied ONLY when `pretrained=True`.
     """
     def __init__(self, annotations_file, cough_dir, speech_dir,
                  arch, is_train=False, augmentation="none",
@@ -251,14 +240,14 @@ class EarlyFusionFlatDataset(Dataset):
         )
 
         if self.arch == "resnet":
-            # ----- Cough pipeline -----
+            #  Cough pipeline
             c_img = self._pad_to_224(c_raw)                       # [224, 224]
             c_min, c_max = c_img.min(), c_img.max()
             c_scaled = (c_img - c_min) / (c_max - c_min + 1e-8)   # [0, 1]
             if self.is_train and self.augmentation != "none":
                 c_scaled = apply_augmentation(c_scaled, self.augmentation)
 
-            # ----- Speech pipeline -----
+            # Speech pipeline
             m_speech = self._mean_speech_image(pid)               # [128, 43]
             m_speech = self._pad_to_224(m_speech)                 # [224, 224]
             s_min, s_max = m_speech.min(), m_speech.max()
@@ -279,11 +268,7 @@ class EarlyFusionFlatDataset(Dataset):
             ).squeeze(0).squeeze(0)                               # [224, 224]
 
             m_speech = self._mean_speech_image(pid)               # [128, 43]
-            m_speech = self._pad_to_224(m_speech)                 # [224, 224]
-
-            c_flat = torch.flatten(c_resized)                     # [50176]
-            m_flat = torch.flatten(m_speech)                      # [50176]
-            fused  = torch.cat([c_flat, m_flat], dim=0)   '''        # [100352]
+            m_speech = self._pad_to_224(m_speech)                 # [224, 224] '''      
 
         return fused, label, pid
 
@@ -328,5 +313,125 @@ def get_early_fusion_data(dataset, data_folds, i, j, cough_dir, speech_dir, loss
         if test_ds else None
     return train_loader, val_loader, test_loader
 
+
 class LateFusionDataset(Dataset):
-    "Returns two modalities seperately"
+    """
+    Returns the two modalities seperately so a two-branch model can consume them.
+
+    Each item:
+        cough:  [3, 224, 224]   ResNet-ready, 3-channel copy of the mel-spectrogram
+        speech: [128]           time-averaged log-mel (one vector per patient)
+        label:  int
+        pid:    str
+    """
+    def __init__(self, annotations_file, cough_dir, speech_dir,
+                 is_train=False, augmentation="none", pretrained=False):
+        self.df = pd.read_csv(annotations_file)
+        self.df['patient_id'] = self.df['Cough_ID'].astype(str).apply(
+            lambda x: x.split('/')[0]
+        )
+        # Drop coughs whose .npy is missing
+        self.df = self.df[self.df['Cough_ID'].astype(str).map(
+            lambda cid: os.path.exists(os.path.join(cough_dir, cid + ".npy"))
+        )].reset_index(drop=True)
+        # Drop patients whose speech .pt is missing
+        self.df = self.df[self.df['patient_id'].map(
+            lambda pid: os.path.exists(os.path.join(speech_dir, f"{pid}.pt"))
+        )].reset_index(drop=True)
+
+        self.cough_dir    = cough_dir
+        self.speech_dir   = speech_dir
+        self.is_train     = is_train
+        self.augmentation = augmentation
+        self.pretrained   = pretrained
+
+    def __len__(self):
+        return len(self.df)
+
+    def _pad_to_224(self, img):
+        if img.ndim == 2:
+            img = img.unsqueeze(0)
+        H, W = img.shape[-2], img.shape[-1]
+        if H > 224:
+            top = (H - 224) // 2
+            img = img[:, top:top + 224, :]
+            H = 224
+        if W > 224:
+            left = (W - 224) // 2
+            img = img[:, :, left:left + 224]
+            W = 224
+        pad_h = max(0, 224 - H)
+        pad_w = max(0, 224 - W)
+        if pad_h > 0 or pad_w > 0:
+            img = torch.nn.functional.pad(img, (0, pad_w, 0, pad_h), "constant", 0)
+        return img[0]
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        cid   = str(row['Cough_ID'])
+        pid   = str(row['patient_id'])
+        label = int(row['Status'])
+
+        # Cough branch 
+        c_raw = torch.tensor(
+            np.load(os.path.join(self.cough_dir, cid + ".npy")),
+            dtype=torch.float32,
+        )                                                 # [128, 43]
+        c_img = self._pad_to_224(c_raw)                   # [224, 224]
+        c_min, c_max = c_img.min(), c_img.max()
+        c_scaled = (c_img - c_min) / (c_max - c_min + 1e-8)
+        if self.is_train and self.augmentation != "none":
+            c_scaled = apply_augmentation(c_scaled, self.augmentation)
+        c_3ch = c_scaled.unsqueeze(0).repeat(3, 1, 1)     # [3, 224, 224]
+
+        # Speech branch
+        s_raw = torch.load(
+            os.path.join(self.speech_dir, f"{pid}.pt"),
+            weights_only=True,
+        )                                                 # [128, 43]
+        s_vec = s_raw.mean(dim=1)                         # [128]
+
+        return c_3ch, s_vec, label, pid
+
+
+def get_late_fusion_data(dataset, data_folds, i, j, cough_dir, speech_dir,
+                         loss, batch_size, num_outer_folds=10,
+                         augmentation="none", pretrained=False):
+    """
+    Same nested-CV split as get_data / get_early_fusion_data:
+      train on all folds except i (test) and j (dev).
+    Each batch is (cough [B,3,224,224], speech [B,128], labels, pids).
+    """
+    train_folds = [data_folds + f"/fold_{k}" for k in range(num_outer_folds)
+                   if k != j and k != i]
+    dev_file  = data_folds + f"/fold_{j}.csv"
+    test_file = data_folds + f"/fold_{i}.csv"
+
+    train_ds = ConcatDataset([
+        LateFusionDataset(f + ".csv", cough_dir, speech_dir,
+                          is_train=True, augmentation=augmentation,
+                          pretrained=pretrained)
+        for f in train_folds
+    ])
+    val_ds  = LateFusionDataset(dev_file,  cough_dir, speech_dir,
+                                is_train=False, augmentation=augmentation,
+                                pretrained=pretrained) if j is not None else None
+    test_ds = LateFusionDataset(test_file, cough_dir, speech_dir,
+                                is_train=False, augmentation=augmentation,
+                                pretrained=pretrained) if i is not None else None
+
+    def collate(batch):
+        cough, speech, labels, pids = zip(*batch)
+        return (torch.stack(cough),
+                torch.stack(speech),
+                torch.tensor(labels, dtype=torch.long),
+                list(pids))
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                              num_workers=4, drop_last=True, collate_fn=collate)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
+                            num_workers=4, collate_fn=collate) if val_ds else None
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False,
+                             num_workers=4, collate_fn=collate) if test_ds else None
+    return train_loader, val_loader, test_loader
+
