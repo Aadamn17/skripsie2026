@@ -1,8 +1,10 @@
+import glob
 import itertools
 import os
 import random
 import torch
 import numpy as np
+import pandas as pd
 from dataloader import *
 from model_scripts import *
 
@@ -39,13 +41,61 @@ speech_dir     = "data/cage/preprocessed_speech"
 
 LR_BATCH_SIZE = 256
 
+KEY_COLUMNS = ["fusion", "arch", "test_set", "dev_set",
+               "lr", "wd", "augmentation", "use_pretrained"]
+
 
 def build_log_filename(point):
+    """One CSV per config. All 90 fold pairs append rows into this file."""
     return os.path.join(RESULTS_DIR, (
         f"fusion-{point['fusion']}_dataset-{point['dataset']}_arch-{point['arch']}_"
         f"pretrained-{str(point['use_pretrained']).lower()}_aug-{point['augmentation']}_"
         f"lr-{point['learning_rate']}_wd-{point['weight_decay']}.csv"
     ))
+
+
+def point_key(point):
+    """A hashable key that identifies one (config, fold pair)."""
+    return (
+        str(point["fusion"]),
+        str(point["arch"]),
+        int(point["test_set"]),
+        int(point["dev_set"]),
+        float(point["learning_rate"]),
+        float(point["weight_decay"]),
+        str(point["augmentation"]),
+        bool(point["use_pretrained"]),
+    )
+
+
+def load_completed_keys(results_dir):
+    """Scan every existing results CSV and return the set of completed
+    (config, test_set, dev_set) tuples."""
+    completed = set()
+    if not os.path.isdir(results_dir):
+        return completed
+    for f in glob.glob(os.path.join(results_dir, "*.csv")):
+        try:
+            df = pd.read_csv(f)
+        except Exception:
+            continue
+        if not set(KEY_COLUMNS).issubset(df.columns):
+            continue
+        for _, row in df.iterrows():
+            try:
+                completed.add((
+                    str(row["fusion"]),
+                    str(row["arch"]),
+                    int(row["test_set"]),
+                    int(row["dev_set"]),
+                    float(row["lr"]),
+                    float(row["wd"]),
+                    str(row["aug"]),
+                    bool(row["use_pretrained"]),
+                ))
+            except (ValueError, TypeError):
+                continue
+    return completed
 
 
 def main(grid):
@@ -56,6 +106,10 @@ def main(grid):
 
     os.makedirs(RESULTS_DIR,     exist_ok=True)
     os.makedirs(PREDICTIONS_DIR, exist_ok=True)
+
+    # Load any completed work so a restart does not redo it
+    completed = load_completed_keys(RESULTS_DIR)
+    print(f"[resume] {len(completed)} (config, fold pair) combinations already completed")
 
     header = (
         "fusion,dataset,test_set,dev_set,arch,use_pretrained,augmentation,"
@@ -73,8 +127,8 @@ def main(grid):
         if point['arch'] == "lr" and point['use_pretrained'] is False:
             continue
 
-        log_file = build_log_filename(point)
-        if os.path.exists(log_file) and os.path.getsize(log_file) > len(header) + 1:
+        # Skip only if this exact (config, fold pair) is already done
+        if point_key(point) in completed:
             continue
 
         effective_loss       = "cross_entropy" if point['arch'] == "lr" else point['loss_selected']
@@ -130,6 +184,8 @@ def main(grid):
         history = train_validate(train, val, test, model, point,
                                  predictions_dir=PREDICTIONS_DIR)
 
+        # Append this fold pair's rows to the config's CSV
+        log_file = build_log_filename(point)
         first_write = not os.path.exists(log_file) or os.path.getsize(log_file) == 0
         with open(log_file, "a") as f:
             if first_write:
@@ -146,6 +202,8 @@ def main(grid):
                     f"{h['test_acc']:.4f},{h['test_auc']:.4f},{h['test_sens']:.4f},{h['test_spec']:.4f},"
                     f"{h['is_best']}\n"
                 )
+
+        completed.add(point_key(point))
 
 
 if __name__ == "__main__":
