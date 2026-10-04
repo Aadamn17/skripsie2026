@@ -3,26 +3,20 @@ import torch
 import numpy as np
 import pandas as pd
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
-import torchvision.transforms.functional as TF
+from utils import pad_to_224, seed_worker, create_generator, standard_collate, late_fusion_collate
 
 
+def per_frequency_normalize(spectrogram, eps=1e-8):
+    mean = spectrogram.mean(dim=-1, keepdim=True)
+    std  = spectrogram.std(dim=-1, keepdim=True)
+    return (spectrogram - mean) / (std + eps)
 
 
 def gaussian_noise(image, std=0.05):
-    """Additive white noise with standard deviation `std`.
-
-    Applied after the [0, 1] rescale, so `std = 0.05` is 5% of the signal
-    range.
-    """
     return image + torch.randn_like(image) * std
 
 
 def solarisation(image, threshold=0.5):
-    """Invert values above `threshold`. Returns a new tensor (no in-place).
-
-    Applied after the [0, 1] rescale, so `threshold = 0.5` inverts the upper
-    half of the rescaled range.
-    """
     out  = image.clone()
     mask = out > threshold
     out[mask] = -out[mask]
@@ -36,28 +30,12 @@ def apply_augmentation(image, aug_type):
         return gaussian_noise(image)
     elif aug_type == "solarisation":
         return solarisation(image, threshold=0.5)
-    else:
-        raise ValueError(f"Unknown augmentation: {aug_type}")
-
-
+    raise ValueError(f"Unknown augmentation: {aug_type}")
 
 
 class CoughDatasetCleaned(Dataset):
-    """
-    Cough-only dataset used for both the single-modality ResNet-18 baseline
-    and the single-modality logistic-regression baseline.
-
-    Input pipeline:
-        1. Load raw log-mel spectrogram  [128, 43]  (no per-bin standardisation)
-        2. Pad to 224x224 (centre-crop if larger, zero-pad if smaller)
-        3. Min-max rescale to [0, 1] using bounds from the padded image
-        4. Augment (training only)
-        5. Repeat to 3 channels
-        6. ImageNet channel normalisation  -- only when `pretrained=True`
-    """
     def __init__(self, dataset, annotations_file, dir, loss,
-                 fusion_type, is_train=False, augmentation="none",
-                 pretrained=False):
+                 is_train=False, augmentation="none"):
         self.labels = pd.read_csv(annotations_file)
         self.labels["patient_id"] = self.labels["Cough_ID"].astype(str).apply(
             lambda x: x.split("/")[0]
@@ -65,113 +43,66 @@ class CoughDatasetCleaned(Dataset):
         self.dataset      = dataset
         self.dir          = dir
         self.loss         = loss
-        self.fusion_type  = fusion_type
         self.is_train     = is_train
         self.augmentation = augmentation
-        self.pretrained   = pretrained
 
     def __len__(self):
         return len(self.labels)
-
-    def _pad_to_224(self, img):
-        """Centre-crop if larger than 224, then zero-pad to exactly 224x224."""
-        if img.ndim == 2:
-            img = img.unsqueeze(0)                 # [1, H, W]
-        H, W = img.shape[-2], img.shape[-1]
-
-        if H > 224:
-            top = (H - 224) // 2
-            img = img[:, top:top + 224, :]
-            H   = 224
-        if W > 224:
-            left = (W - 224) // 2
-            img  = img[:, :, left:left + 224]
-            W    = 224
-
-        pad_h = max(0, 224 - H)
-        pad_w = max(0, 224 - W)
-        if pad_h > 0 or pad_w > 0:
-            img = torch.nn.functional.pad(img, (0, pad_w, 0, pad_h), "constant", 0)
-        return img[0]
 
     def __getitem__(self, idx):
         label = self.labels["Status"][idx]
         pid   = self.labels["patient_id"][idx]
         path  = os.path.join(self.dir, str(self.labels["Cough_ID"][idx]) + ".npy")
-
-        # .npy is stored as [freq, time] = [128, 43]; 
         image_raw = torch.tensor(np.load(path), dtype=torch.float32)
 
         if self.loss == "cross_entropy":
-            # Logistic-regression baseline: time-averaged raw log-mel -> [128]
+            #image_raw = per_frequency_normalize(image_raw)
             image = image_raw.mean(dim=1)
             return image, label, pid
-
         elif self.loss == "cross_entropy_resnet":
-            image = self._pad_to_224(image_raw)                 # [224, 224]
-            c_min, c_max = image.min(), image.max()
-            image = (image - c_min) / (c_max - c_min + 1e-8)    # [0, 1]
+            image_raw = per_frequency_normalize(image_raw)
+            image = pad_to_224(image_raw)
             if self.is_train and self.augmentation != "none":
                 image = apply_augmentation(image, self.augmentation)
-            image = image.unsqueeze(0).repeat(3, 1, 1)          # [3, 224, 224]
-            
-            image = TF.normalize(image,
-                                     mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
+            image = image.unsqueeze(0).repeat(3, 1, 1)
             return image, label, pid
 
 
 def get_data(dataset, data_folds, i, j, cough_dir, loss, batch_size,
-             num_outer_folds=10, augmentation="none", pretrained=False):
-    train_set_files = [data_folds + f"/fold_{k}" for k in range(num_outer_folds)
-                       if k != j and k != i]
-    dev_set_file  = data_folds + f"/fold_{j}"
-    test_set_file = data_folds + f"/fold_{i}"
+             num_outer_folds=10, augmentation="none"):
+    train_set_files = [data_folds + f"/fold_{k}"
+                       for k in range(num_outer_folds) if k != j and k != i]
 
     train_data_set = ConcatDataset([
-        CoughDatasetCleaned(dataset, file + ".csv", cough_dir, loss,
-                            "none", is_train=True, augmentation=augmentation,
-                            pretrained=pretrained)
-        for file in train_set_files
+        CoughDatasetCleaned(dataset, f + ".csv", cough_dir, loss,
+                            is_train=True, augmentation=augmentation)
+        for f in train_set_files
     ])
-    val_ds = CoughDatasetCleaned(dataset, dev_set_file + ".csv", cough_dir, loss,
-                                 "none", is_train=False, augmentation=augmentation,
-                                 pretrained=pretrained) \
-        if j is not None else None
-    test_ds = CoughDatasetCleaned(dataset, test_set_file + ".csv", cough_dir, loss,
-                                  "none", is_train=False, augmentation=augmentation,
-                                  pretrained=pretrained) \
-        if i is not None else None
+    val_ds  = CoughDatasetCleaned(dataset, data_folds + f"/fold_{j}.csv",
+                                  cough_dir, loss, is_train=False,
+                                  augmentation=augmentation) if j is not None else None
+    test_ds = CoughDatasetCleaned(dataset, data_folds + f"/fold_{i}.csv",
+                                  cough_dir, loss, is_train=False,
+                                  augmentation=augmentation) if i is not None else None
 
-    def collate(batch):
-        images, labels, pids = zip(*batch)
-        return (torch.stack(images),
-                torch.tensor(labels, dtype=torch.long),
-                list(pids))
-
+    g = create_generator()
     train_data = DataLoader(train_data_set, batch_size=batch_size, num_workers=4,
-                            shuffle=True, drop_last=True, collate_fn=collate)
-    val_data = DataLoader(val_ds, batch_size=batch_size, num_workers=4,
-                          shuffle=False, collate_fn=collate) if val_ds else None
+                            pin_memory=True, persistent_workers=True,
+                            shuffle=True, drop_last=True,
+                            collate_fn=standard_collate,
+                            worker_init_fn=seed_worker, generator=g)
+    val_data  = DataLoader(val_ds, batch_size=batch_size, num_workers=4,
+                           pin_memory=True, persistent_workers=True,
+                           shuffle=False, collate_fn=standard_collate) if val_ds else None
     test_data = DataLoader(test_ds, batch_size=batch_size, num_workers=4,
-                           shuffle=False, collate_fn=collate) if test_ds else None
-
+                           pin_memory=True, persistent_workers=True,
+                           shuffle=False, collate_fn=standard_collate) if test_ds else None
     return train_data, val_data, test_data
 
 
-# EARLY-FUSION DATASET
-
 class EarlyFusionFlatDataset(Dataset):
-    """
-    Early-fusion dataset. Produces a 3-channel input:
-        channel 0: cough (scaled to [0, 1])
-        channel 1: cough (duplicate)
-        channel 2: patient-level mean speech (already in [0, 1])
-
-    """
-    def __init__(self, annotations_file, cough_dir, speech_dir,
-                 arch, is_train=False, augmentation="none",
-                 pretrained=False):
+    def __init__(self, annotations_file, cough_dir, speech_dir, arch,
+                 is_train=False, augmentation="none"):
         self.df = pd.read_csv(annotations_file)
         self.df['patient_id'] = self.df['Cough_ID'].astype(str).apply(
             lambda x: x.split('/')[0]
@@ -187,42 +118,16 @@ class EarlyFusionFlatDataset(Dataset):
             lambda pid: os.path.exists(os.path.join(speech_dir, f"{pid}.pt"))
         )].reset_index(drop=True)
 
-        self.arch    = arch
-        self.samples = []
+        self.arch, self.samples = arch, []
         for _, row in self.patients.iterrows():
-            pid   = row['patient_id']
-            label = int(row['Status'])
             for cid in row['Cough_ID']:
-                self.samples.append((cid, pid, label))
+                self.samples.append((cid, row['patient_id'], int(row['Status'])))
 
-        self.cough_dir    = cough_dir
-        self.speech_dir   = speech_dir
-        self.is_train     = is_train
-        self.augmentation = augmentation
-        self.pretrained   = pretrained
+        self.cough_dir, self.speech_dir = cough_dir, speech_dir
+        self.is_train, self.augmentation = is_train, augmentation
 
     def __len__(self):
         return len(self.samples)
-
-    def _pad_to_224(self, img):
-        if img.ndim == 2:
-            img = img.unsqueeze(0)
-        H, W = img.shape[-2], img.shape[-1]
-
-        if H > 224:
-            top = (H - 224) // 2
-            img = img[:, top:top + 224, :]
-            H   = 224
-        if W > 224:
-            left = (W - 224) // 2
-            img  = img[:, :, left:left + 224]
-            W    = 224
-
-        pad_h = max(0, 224 - H)
-        pad_w = max(0, 224 - W)
-        if pad_h > 0 or pad_w > 0:
-            img = torch.nn.functional.pad(img, (0, pad_w, 0, pad_h), "constant", 0)
-        return img[0]
 
     def _mean_speech_image(self, pid):
         pt_path = os.path.join(self.speech_dir, f"{pid}.pt")
@@ -232,139 +137,76 @@ class EarlyFusionFlatDataset(Dataset):
 
     def __getitem__(self, idx):
         cid, pid, label = self.samples[idx]
+        c_raw = torch.tensor(np.load(os.path.join(self.cough_dir, cid + ".npy")),
+                             dtype=torch.float32)
 
-        # Cough: [128, 43] = [freq, time]  (no transpose)
-        c_raw = torch.tensor(
-            np.load(os.path.join(self.cough_dir, cid + ".npy")),
-            dtype=torch.float32,
-        )
+        c_raw = per_frequency_normalize(c_raw)
+        c_scaled = pad_to_224(c_raw)
+        if self.is_train and self.augmentation != "none":
+            c_scaled = apply_augmentation(c_scaled, self.augmentation)
 
-        if self.arch == "resnet":
-            #  Cough pipeline
-            c_img = self._pad_to_224(c_raw)                       # [224, 224]
-            c_min, c_max = c_img.min(), c_img.max()
-            c_scaled = (c_img - c_min) / (c_max - c_min + 1e-8)   # [0, 1]
-            if self.is_train and self.augmentation != "none":
-                c_scaled = apply_augmentation(c_scaled, self.augmentation)
+        m_speech = self._mean_speech_image(pid)
+        m_speech = per_frequency_normalize(m_speech)
+        m_speech = pad_to_224(m_speech)
 
-            # Speech pipeline
-            m_speech = self._mean_speech_image(pid)               # [128, 43]
-            m_speech = self._pad_to_224(m_speech)                 # [224, 224]
-            s_min, s_max = m_speech.min(), m_speech.max()
-            m_speech = (m_speech - s_min) / (s_max - s_min + 1e-8)  # [0, 1]
-            # ----- Fuse -----
-            fused = torch.stack([c_scaled, c_scaled, m_speech], dim=0)
-            if self.pretrained:
-                fused = TF.normalize(fused,
-                                     mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
-
-        '''elif self.arch == "lr":
-            # Logistic-regression variant: bilinear-resize cough to 224x224,
-            # flatten both streams, concatenate.
-            c_4d = c_raw.unsqueeze(0).unsqueeze(0)                # [1, 1, 128, 43]
-            c_resized = torch.nn.functional.interpolate(
-                c_4d, size=(224, 224), mode="bilinear", align_corners=False
-            ).squeeze(0).squeeze(0)                               # [224, 224]
-
-            m_speech = self._mean_speech_image(pid)               # [128, 43]
-            m_speech = self._pad_to_224(m_speech)                 # [224, 224] '''      
-
-        return fused, label, pid
+        return torch.stack([c_scaled, c_scaled, m_speech], dim=0), label, pid
 
 
 def get_early_fusion_data(dataset, data_folds, i, j, cough_dir, speech_dir, loss,
-                          batch_size, arch, num_outer_folds=10, augmentation="none",
-                          pretrained=False):
-    train_folds_noext = [data_folds + f"/fold_{k}" for k in range(num_outer_folds)
-                         if k != j and k != i]
-    train_folds_csv = [f + ".csv" for f in train_folds_noext]
-    dev_file  = data_folds + f"/fold_{j}.csv"
-    test_file = data_folds + f"/fold_{i}.csv"
+                          batch_size, arch, num_outer_folds=10, augmentation="none"):
+    train_folds = [data_folds + f"/fold_{k}.csv"
+                   for k in range(num_outer_folds) if k != j and k != i]
 
     train_ds = ConcatDataset([
         EarlyFusionFlatDataset(f, cough_dir, speech_dir, arch,
-                               is_train=True, augmentation=augmentation,
-                               pretrained=pretrained)
-        for f in train_folds_csv
+                               is_train=True, augmentation=augmentation)
+        for f in train_folds
     ])
-    val_ds = EarlyFusionFlatDataset(dev_file, cough_dir, speech_dir, arch,
-                                    is_train=False, augmentation=augmentation,
-                                    pretrained=pretrained) \
+    val_ds  = EarlyFusionFlatDataset(data_folds + f"/fold_{j}.csv",
+                                     cough_dir, speech_dir, arch,
+                                     is_train=False, augmentation=augmentation) \
         if j is not None else None
-    test_ds = EarlyFusionFlatDataset(test_file, cough_dir, speech_dir, arch,
-                                     is_train=False, augmentation=augmentation,
-                                     pretrained=pretrained) \
+    test_ds = EarlyFusionFlatDataset(data_folds + f"/fold_{i}.csv",
+                                     cough_dir, speech_dir, arch,
+                                     is_train=False, augmentation=augmentation) \
         if i is not None else None
 
-    def collate(batch):
-        images, labels, pids = zip(*batch)
-        return (torch.stack(images),
-                torch.tensor(labels, dtype=torch.long),
-                list(pids))
-
+    g = create_generator()
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                              num_workers=4, drop_last=True, collate_fn=collate)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
-                            num_workers=4, drop_last=False, collate_fn=collate) \
-        if val_ds else None
+                              num_workers=4, pin_memory=True,
+                              persistent_workers=True, drop_last=True,
+                              collate_fn=standard_collate,
+                              worker_init_fn=seed_worker, generator=g)
+    val_loader  = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
+                             num_workers=4, pin_memory=True,
+                             persistent_workers=True,
+                             collate_fn=standard_collate) if val_ds else None
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False,
-                             num_workers=4, drop_last=False, collate_fn=collate) \
-        if test_ds else None
+                             num_workers=4, pin_memory=True,
+                             persistent_workers=True,
+                             collate_fn=standard_collate) if test_ds else None
     return train_loader, val_loader, test_loader
 
 
 class LateFusionDataset(Dataset):
-    """
-    Returns the two modalities seperately so a two-branch model can consume them.
-
-    Each item:
-        cough:  [3, 224, 224]   ResNet-ready, 3-channel copy of the mel-spectrogram
-        speech: [128]           time-averaged log-mel (one vector per patient)
-        label:  int
-        pid:    str
-    """
     def __init__(self, annotations_file, cough_dir, speech_dir,
-                 is_train=False, augmentation="none", pretrained=False):
+                 is_train=False, augmentation="none"):
         self.df = pd.read_csv(annotations_file)
         self.df['patient_id'] = self.df['Cough_ID'].astype(str).apply(
             lambda x: x.split('/')[0]
         )
-        # Drop coughs whose .npy is missing
         self.df = self.df[self.df['Cough_ID'].astype(str).map(
             lambda cid: os.path.exists(os.path.join(cough_dir, cid + ".npy"))
         )].reset_index(drop=True)
-        # Drop patients whose speech .pt is missing
         self.df = self.df[self.df['patient_id'].map(
             lambda pid: os.path.exists(os.path.join(speech_dir, f"{pid}.pt"))
         )].reset_index(drop=True)
 
-        self.cough_dir    = cough_dir
-        self.speech_dir   = speech_dir
-        self.is_train     = is_train
-        self.augmentation = augmentation
-        self.pretrained   = pretrained
+        self.cough_dir, self.speech_dir = cough_dir, speech_dir
+        self.is_train, self.augmentation = is_train, augmentation
 
     def __len__(self):
         return len(self.df)
-
-    def _pad_to_224(self, img):
-        if img.ndim == 2:
-            img = img.unsqueeze(0)
-        H, W = img.shape[-2], img.shape[-1]
-        if H > 224:
-            top = (H - 224) // 2
-            img = img[:, top:top + 224, :]
-            H = 224
-        if W > 224:
-            left = (W - 224) // 2
-            img = img[:, :, left:left + 224]
-            W = 224
-        pad_h = max(0, 224 - H)
-        pad_w = max(0, 224 - W)
-        if pad_h > 0 or pad_w > 0:
-            img = torch.nn.functional.pad(img, (0, pad_w, 0, pad_h), "constant", 0)
-        return img[0]
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
@@ -372,75 +214,50 @@ class LateFusionDataset(Dataset):
         pid   = str(row['patient_id'])
         label = int(row['Status'])
 
-        # Cough branch 
-        c_raw = torch.tensor(
-            np.load(os.path.join(self.cough_dir, cid + ".npy")),
-            dtype=torch.float32,
-        )                                                 # [128, 43]
-        c_img = self._pad_to_224(c_raw)                   # [224, 224]
-        c_min, c_max = c_img.min(), c_img.max()
-        c_scaled = (c_img - c_min) / (c_max - c_min + 1e-8)
+        c_raw = torch.tensor(np.load(os.path.join(self.cough_dir, cid + ".npy")),
+                             dtype=torch.float32)
+        c_raw = per_frequency_normalize(c_raw)
+        c_img = pad_to_224(c_raw)
         if self.is_train and self.augmentation != "none":
-            c_scaled = apply_augmentation(c_scaled, self.augmentation)
-        c_3ch = c_scaled.unsqueeze(0).repeat(3, 1, 1)     # [3, 224, 224]
+            c_img = apply_augmentation(c_img, self.augmentation)
+        c_3ch = c_img.unsqueeze(0).repeat(3, 1, 1)
 
-        # Speech branch
-        s_raw = torch.load(
-            os.path.join(self.speech_dir, f"{pid}.pt"),
-            weights_only=True,
-        )                                                 # [128, 43]
-        s_vec = s_raw.mean(dim=1)                         # [128]
+        s_raw = torch.load(os.path.join(self.speech_dir, f"{pid}.pt"),
+                           weights_only=True)
+        speech = s_raw.mean(dim=1)
 
-        return c_3ch, s_vec, label, pid
+        return c_3ch, speech, label, pid
 
 
 def get_late_fusion_data(dataset, data_folds, i, j, cough_dir, speech_dir,
-                         loss, batch_size, num_outer_folds=10,
-                         augmentation="none", pretrained=False):
-    """
-    Same nested-CV split as get_data / get_early_fusion_data:
-      train on all folds except i (test) and j (dev).
-    Each batch is (cough [B,3,224,224], speech [B,128], labels, pids).
-    """
-    train_folds = [data_folds + f"/fold_{k}" for k in range(num_outer_folds)
-                   if k != j and k != i]
-    dev_file  = data_folds + f"/fold_{j}.csv"
-    test_file = data_folds + f"/fold_{i}.csv"
+                         loss, batch_size, num_outer_folds=10, augmentation="none"):
+    train_folds = [data_folds + f"/fold_{k}.csv"
+                   for k in range(num_outer_folds) if k != j and k != i]
 
     train_ds = ConcatDataset([
-        LateFusionDataset(f + ".csv", cough_dir, speech_dir,
-                          is_train=True, augmentation=augmentation,
-                          pretrained=pretrained)
+        LateFusionDataset(f, cough_dir, speech_dir,
+                          is_train=True, augmentation=augmentation)
         for f in train_folds
     ])
-    val_ds  = LateFusionDataset(dev_file,  cough_dir, speech_dir,
-                                is_train=False, augmentation=augmentation,
-                                pretrained=pretrained) if j is not None else None
-    test_ds = LateFusionDataset(test_file, cough_dir, speech_dir,
-                                is_train=False, augmentation=augmentation,
-                                pretrained=pretrained) if i is not None else None
+    val_ds  = LateFusionDataset(data_folds + f"/fold_{j}.csv", cough_dir, speech_dir,
+                                is_train=False, augmentation=augmentation) \
+        if j is not None else None
+    test_ds = LateFusionDataset(data_folds + f"/fold_{i}.csv", cough_dir, speech_dir,
+                                is_train=False, augmentation=augmentation) \
+        if i is not None else None
 
-    def collate(batch):
-        cough, speech, labels, pids = zip(*batch)
-        return (torch.stack(cough),
-                torch.stack(speech),
-                torch.tensor(labels, dtype=torch.long),
-                list(pids))
-
+    g = create_generator()
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                              num_workers=4, drop_last=True, collate_fn=collate)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
-                            num_workers=4, collate_fn=collate) if val_ds else None
+                              num_workers=4, pin_memory=True,
+                              persistent_workers=True, drop_last=True,
+                              collate_fn=late_fusion_collate,
+                              worker_init_fn=seed_worker, generator=g)
+    val_loader  = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
+                             num_workers=4, pin_memory=True,
+                             persistent_workers=True,
+                             collate_fn=late_fusion_collate) if val_ds else None
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False,
-                             num_workers=4, collate_fn=collate) if test_ds else None
+                             num_workers=4, pin_memory=True,
+                             persistent_workers=True,
+                             collate_fn=late_fusion_collate) if test_ds else None
     return train_loader, val_loader, test_loader
-
-'''def get_raw_speech_data(dataset, data_folds, i, j, raw_speech_dir,
-                    batch_size, num_outer_folds=10):
-    """
-    Returns a DataLoader for the raw speech data of the patients in the
-    the raw speech is .wav files, that are to be fed into wav2vec2. The DataLoader returns a batch of (speech [B, 1, T], labels, pids).
-    """
-    train_folds = [data_folds + f"/fold_{k}" for k in range(num_outer_folds)
-                   if k != j and k != i]    
-    '''

@@ -1,0 +1,17 @@
+fusion,dataset,test_set,dev_set,arch,use_pretrained,augmentation,lr,wd,batch_size,epoch,train_loss,dev_loss_patient,dev_loss_cough,dev_acc,dev_auc,dev_sens,dev_spec,test_loss_patient,test_loss_cough,test_acc,test_auc,test_sens,test_spec,is_best
+none,cage,0,1,resnet,True,none,1e-05,0.0001,32,1,0.7056,0.6973,0.7271,0.2093,0.4881,1.0000,0.0556,nan,nan,nan,nan,nan,nan,0
+none,cage,0,1,resnet,True,none,1e-05,0.0001,32,2,0.6820,0.6846,0.6669,0.6047,0.5516,0.1429,0.6944,nan,nan,nan,nan,nan,nan,0
+none,cage,0,1,resnet,True,none,1e-05,0.0001,32,3,0.6718,0.6804,0.6732,0.6047,0.6151,0.4286,0.6389,nan,nan,nan,nan,nan,nan,0
+none,cage,0,1,resnet,True,none,1e-05,0.0001,32,4,0.6513,0.6765,0.6522,0.6512,0.6310,0.1429,0.7500,nan,nan,nan,nan,nan,nan,0
+none,cage,0,1,resnet,True,none,1e-05,0.0001,32,5,0.6365,0.6697,0.6715,0.5814,0.6508,0.4286,0.6111,nan,nan,nan,nan,nan,nan,1
+none,cage,0,1,resnet,True,none,1e-05,0.0001,32,6,0.6255,0.6799,0.6068,0.7907,0.6429,0.0000,0.9444,nan,nan,nan,nan,nan,nan,1
+none,cage,0,1,resnet,True,none,1e-05,0.0001,32,7,0.6102,0.6565,0.6670,0.6744,0.6706,0.4286,0.7222,nan,nan,nan,nan,nan,nan,1
+none,cage,0,1,resnet,True,none,1e-05,0.0001,32,8,0.5957,0.6776,0.6418,0.7674,0.6230,0.1429,0.8889,nan,nan,nan,nan,nan,nan,0
+none,cage,0,1,resnet,True,none,1e-05,0.0001,32,9,0.5738,0.6730,0.6180,0.7907,0.6706,0.1429,0.9167,nan,nan,nan,nan,nan,nan,1
+none,cage,0,1,resnet,True,none,1e-05,0.0001,32,10,0.5657,0.6623,0.6339,0.7674,0.6865,0.2857,0.8611,0.6524,0.6661,0.7907,0.7103,0.1429,0.9167,1
+none,cage,0,1,resnet,True,none,1e-05,0.0001,32,11,0.5449,0.6590,0.6758,0.6744,0.6627,0.1429,0.7778,nan,nan,nan,nan,nan,nan,0
+none,cage,0,1,resnet,True,none,1e-05,0.0001,32,12,0.5283,0.6927,0.6686,0.7442,0.6349,0.1429,0.8611,nan,nan,nan,nan,nan,nan,0
+none,cage,0,1,resnet,True,none,1e-05,0.0001,32,13,0.5095,0.6682,0.6891,0.6512,0.6429,0.1429,0.7500,nan,nan,nan,nan,nan,nan,0
+none,cage,0,1,resnet,True,none,1e-05,0.0001,32,14,0.5033,0.7497,0.6617,0.8140,0.6389,0.1429,0.9444,nan,nan,nan,nan,nan,nan,0
+none,cage,0,1,resnet,True,none,1e-05,0.0001,32,15,0.4833,0.6937,0.6592,0.7442,0.7063,0.1429,0.8611,nan,nan,nan,nan,nan,nan,0
+none,cage,0,1,resnet,True,none,1e-05,0.0001,32,16,0.4721,0.7176,0.6667,0.7907,0.6865,0.1429,0.9167,nan,nan,nan,nan,nan,nan,0
