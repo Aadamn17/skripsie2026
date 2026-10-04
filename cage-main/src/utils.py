@@ -2,6 +2,10 @@ import torch
 import random
 import numpy as np
 
+# ImageNet channel statistics, used to normalise the 3-channel input
+IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+IMAGENET_STD  = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+
 
 def pad_to_224(img):
     """Centre-crop if larger than 224, centre-pad with zeros if smaller."""
@@ -18,7 +22,6 @@ def pad_to_224(img):
         img = img[:, :, left:left + 224]
         W = 224
 
-    # symmetric padding so signal stays centred
     pad_h_total = max(0, 224 - H)
     pad_w_total = max(0, 224 - W)
     pad_h_top   = pad_h_total // 2
@@ -33,6 +36,20 @@ def pad_to_224(img):
             "constant", 0,
         )
     return img[0]
+
+
+def min_max_rescale(image, eps=1e-8):
+    """Rescale a tensor to [0, 1] using its own min and max."""
+    vmin = image.min()
+    vmax = image.max()
+    return (image - vmin) / (vmax - vmin + eps)
+
+
+def imagenet_normalize(image):
+    """Normalise a 3-channel tensor with ImageNet statistics."""
+    mean = IMAGENET_MEAN.to(image.device)
+    std  = IMAGENET_STD.to(image.device)
+    return (image - mean) / std
 
 
 def seed_worker(worker_id):

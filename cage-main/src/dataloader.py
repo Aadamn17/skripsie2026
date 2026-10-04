@@ -3,13 +3,10 @@ import torch
 import numpy as np
 import pandas as pd
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
-from utils import pad_to_224, seed_worker, create_generator, standard_collate, late_fusion_collate
-
-
-def per_frequency_normalize(spectrogram, eps=1e-8):
-    mean = spectrogram.mean(dim=-1, keepdim=True)
-    std  = spectrogram.std(dim=-1, keepdim=True)
-    return (spectrogram - mean) / (std + eps)
+from utils import (
+    pad_to_224, min_max_rescale, imagenet_normalize,
+    seed_worker, create_generator, standard_collate, late_fusion_collate,
+)
 
 
 def gaussian_noise(image, std=0.05):
@@ -56,15 +53,19 @@ class CoughDatasetCleaned(Dataset):
         image_raw = torch.tensor(np.load(path), dtype=torch.float32)
 
         if self.loss == "cross_entropy":
-            #image_raw = per_frequency_normalize(image_raw)
-            image = image_raw.mean(dim=1)
+            # Logistic-regression baseline: time-average then globally standardise
+            image = image_raw.mean(dim=1)                        # [128]
+            image = (image - image.mean()) / (image.std() + 1e-8)
             return image, label, pid
+
         elif self.loss == "cross_entropy_resnet":
-            image_raw = per_frequency_normalize(image_raw)
-            image = pad_to_224(image_raw)
+            # Pad, rescale to [0, 1], augment, replicate, ImageNet-normalise
+            image = pad_to_224(image_raw)                        # [224, 224]
+            image = min_max_rescale(image)                       # [0, 1]
             if self.is_train and self.augmentation != "none":
                 image = apply_augmentation(image, self.augmentation)
-            image = image.unsqueeze(0).repeat(3, 1, 1)
+            image = image.unsqueeze(0).repeat(3, 1, 1)           # [3, 224, 224]
+            image = imagenet_normalize(image)                    # ImageNet stats
             return image, label, pid
 
 
@@ -140,16 +141,24 @@ class EarlyFusionFlatDataset(Dataset):
         c_raw = torch.tensor(np.load(os.path.join(self.cough_dir, cid + ".npy")),
                              dtype=torch.float32)
 
-        c_raw = per_frequency_normalize(c_raw)
-        c_scaled = pad_to_224(c_raw)
+        # Cough channel
+        c_img = pad_to_224(c_raw)
+        c_img = min_max_rescale(c_img)
         if self.is_train and self.augmentation != "none":
-            c_scaled = apply_augmentation(c_scaled, self.augmentation)
+            c_img = apply_augmentation(c_img, self.augmentation)
 
+        # Speech channel — patient-level mean, broadcast to image shape
         m_speech = self._mean_speech_image(pid)
-        m_speech = per_frequency_normalize(m_speech)
-        m_speech = pad_to_224(m_speech)
+        if m_speech.ndim == 2:
+            m_speech = m_speech.mean(dim=1)                      # [128]
+        m_speech = m_speech.unsqueeze(1).repeat(1, 43)           # [128, 43]
+        s_img = pad_to_224(m_speech)
+        s_img = min_max_rescale(s_img)
 
-        return torch.stack([c_scaled, c_scaled, m_speech], dim=0), label, pid
+        # Stack, then ImageNet-normalise
+        fused = torch.stack([c_img, c_img, s_img], dim=0)        # [3, 224, 224]
+        fused = imagenet_normalize(fused)
+        return fused, label, pid
 
 
 def get_early_fusion_data(dataset, data_folds, i, j, cough_dir, speech_dir, loss,
@@ -214,17 +223,24 @@ class LateFusionDataset(Dataset):
         pid   = str(row['patient_id'])
         label = int(row['Status'])
 
+        # Cough branch
         c_raw = torch.tensor(np.load(os.path.join(self.cough_dir, cid + ".npy")),
                              dtype=torch.float32)
-        c_raw = per_frequency_normalize(c_raw)
         c_img = pad_to_224(c_raw)
+        c_img = min_max_rescale(c_img)
         if self.is_train and self.augmentation != "none":
             c_img = apply_augmentation(c_img, self.augmentation)
         c_3ch = c_img.unsqueeze(0).repeat(3, 1, 1)
+        c_3ch = imagenet_normalize(c_3ch)
 
+        # Speech branch — time-average then global standardise
         s_raw = torch.load(os.path.join(self.speech_dir, f"{pid}.pt"),
                            weights_only=True)
-        speech = s_raw.mean(dim=1)
+        if s_raw.ndim == 2:
+            speech = s_raw.mean(dim=1)
+        else:
+            speech = s_raw
+        speech = (speech - speech.mean()) / (speech.std() + 1e-8)
 
         return c_3ch, speech, label, pid
 

@@ -6,12 +6,11 @@ import numpy as np
 from dataloader import *
 from model_scripts import *
 
-# Anchor output paths to this file's directory, not the current working directory
+# Anchor output paths to this file's directory
 PROJECT_ROOT    = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR     = os.path.join(PROJECT_ROOT, "results")
 PREDICTIONS_DIR = os.path.join(PROJECT_ROOT, "predictions")
 
-# cudnn settings set once at module import
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark     = False
 
@@ -38,7 +37,6 @@ raw_speech_dir = "data/cage/raw_speech"
 cough_dir      = "data/cage/mel_spectrograms_128"
 speech_dir     = "data/cage/preprocessed_speech"
 
-# LR baseline uses a larger batch
 LR_BATCH_SIZE = 256
 
 
@@ -70,21 +68,15 @@ def main(grid):
         point = dict(zip(grid.keys(), values))
         if point['test_set'] == point['dev_set']:
             continue
-
-        # LR baseline only in single-modality branch
         if point['arch'] == "lr" and point['fusion'] != "none":
             continue
-        # LR has no backbone, so pretrained axis is meaningless
         if point['arch'] == "lr" and point['use_pretrained'] is False:
             continue
 
         log_file = build_log_filename(point)
-
-        # skip configs already completed
         if os.path.exists(log_file) and os.path.getsize(log_file) > len(header) + 1:
             continue
 
-        # dispatch loss and batch size per arch
         effective_loss       = "cross_entropy" if point['arch'] == "lr" else point['loss_selected']
         effective_batch_size = LR_BATCH_SIZE    if point['arch'] == "lr" else point['batch_size']
 

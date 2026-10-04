@@ -84,7 +84,7 @@ class ResNet18(nn.Module):
 
     def train(self, mode=True):
         super().train(mode)
-        # keep frozen BN layers in eval mode
+        # Keep frozen BN layers in eval mode so statistics do not drift
         if self.use_pretrained and mode:
             for m in self.resnet.modules():
                 if isinstance(m, nn.BatchNorm2d):
@@ -128,7 +128,6 @@ class LateFusion(nn.Module):
         return self.fusion_head(fused)
 
     def param_groups(self, base_lr, weight_decay):
-        # speech branch and fusion head both use 10x base_lr
         return [
             {"params": self.cough_backbone.parameters(),
              "lr": base_lr,      "weight_decay": weight_decay},
@@ -183,7 +182,6 @@ def train_validate(train_data, dev_data, test_data, model, params,
         optimizer, T_max=params["num_epochs"]
     )
 
-    # class weights from the underlying datasets
     all_labels = []
     if hasattr(train_data.dataset, "datasets"):
         for ds in train_data.dataset.datasets:
