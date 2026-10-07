@@ -15,6 +15,14 @@ The last condition distinguishes "the model uses the second branch" from
 performs better under `intact`, the speech representation carries information
 that the cough branch does not.
 
+Outputs:
+    src/analysis/ablation_per_fold.csv     one row per fold pair
+    src/analysis/ablation_summary.csv      mean ± std per condition
+    figures/ablation_boxplot.pdf           boxplot of the four AUC distributions
+    figures/ablation_deltas.pdf            bar chart of the three deltas
+    figures/ablation_boxplot.png           same, quick preview
+    figures/ablation_deltas.png            same, quick preview
+
 Usage:
     python3 src/ablation_study.py --fold 0 1
     python3 src/ablation_study.py --limit 5
@@ -31,6 +39,10 @@ from torch.amp import autocast
 from torch.utils.data import DataLoader, ConcatDataset
 from sklearn import metrics
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 from dataloader import LateFusionDataset
 from utils import (
     pad_to_224, min_max_rescale, imagenet_normalize,
@@ -44,6 +56,7 @@ AMP    = dict(device_type="cuda", dtype=torch.bfloat16)
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR   = os.path.join(PROJECT_ROOT, "analysis")
+FIGURES_DIR  = os.path.join(PROJECT_ROOT, "figures")
 
 DATA_FOLDS = "data/cage/data_folds_filtered"
 COUGH_DIR  = "data/cage/mel_spectrograms_128"
@@ -98,12 +111,8 @@ def ablation_collate(batch):
             list(pids))
 
 
-def get_ablation_data(test_fold, dev_fold, batch_size,
-                      is_train_override=None):
-    """
-    Return (train_loader, dev_loader, test_loader) for one fold pair.
-    Train loader is only built if is_train_override is True or None.
-    """
+def get_ablation_data(test_fold, dev_fold, batch_size):
+    """Return (train_loader, dev_loader, test_loader) for one fold pair."""
     train_folds = [
         f"{DATA_FOLDS}/fold_{k}.csv"
         for k in range(10) if k != dev_fold and k != test_fold
@@ -189,10 +198,8 @@ class EarlyStopper:
 # ---------------------------------------------------------------------------
 
 def forward_ablated(model, cough, speech, cough_vec, mode, shuffle_seed=42):
-    """
-    Reproduce LateFusion.forward with the second-branch input replaced
-    according to `mode`.
-    """
+    """Reproduce LateFusion.forward with the second-branch input replaced
+    according to `mode`."""
     cough_logits = model.cough_backbone(cough)
 
     if mode == "intact":
@@ -258,7 +265,6 @@ def evaluate_in_mode(model, loader, mode, shuffle_seed=42):
 # ---------------------------------------------------------------------------
 
 def class_weights_from_loader(train_loader):
-    """Count labels across the training set."""
     counts = torch.zeros(2, dtype=torch.long)
     for _, _, _, labels, _ in train_loader:
         for l in labels:
@@ -305,7 +311,6 @@ def train_and_ablate(test_fold, dev_fold):
             optimizer.step()
         scheduler.step()
 
-        # dev-fold AUC for early stopping (intact mode)
         dev_auc = evaluate_in_mode(model, dev_loader, "intact")
         stopper.step(dev_auc, model, epoch)
         if stopper.should_stop:
@@ -321,17 +326,98 @@ def train_and_ablate(test_fold, dev_fold):
     auc_cough   = evaluate_in_mode(model, test_loader, "cough")
 
     return {
-        "test_set":     test_fold,
-        "dev_set":      dev_fold,
-        "best_epoch":   best_epoch,
-        "auc_intact":   auc_intact,
-        "auc_zero":     auc_zero,
-        "auc_shuffle":  auc_shuffle,
-        "auc_cough":    auc_cough,
+        "test_set":      test_fold,
+        "dev_set":       dev_fold,
+        "best_epoch":    best_epoch,
+        "auc_intact":    auc_intact,
+        "auc_zero":      auc_zero,
+        "auc_shuffle":   auc_shuffle,
+        "auc_cough":     auc_cough,
         "delta_zero":    auc_intact - auc_zero,
         "delta_shuffle": auc_intact - auc_shuffle,
         "delta_cough":   auc_intact - auc_cough,
     }
+
+
+# ---------------------------------------------------------------------------
+# Plotting
+# ---------------------------------------------------------------------------
+
+def make_ablation_plots(df, figures_dir):
+    os.makedirs(figures_dir, exist_ok=True)
+
+    cols   = ["auc_intact", "auc_zero", "auc_shuffle", "auc_cough"]
+    labels = ["Intact", "Zero", "Shuffle", "Cough"]
+    colors = ["#4C72B0", "#DD8452", "#55A868", "#C44E52"]
+
+    # --- boxplot of the four AUCs ---
+    fig, ax = plt.subplots(figsize=(6.5, 4.2))
+    bp = ax.boxplot(
+        [df[c].dropna().values for c in cols],
+        labels=labels,
+        patch_artist=True,
+        widths=0.6,
+        medianprops=dict(color="black", linewidth=1.2),
+        boxprops=dict(linewidth=0.9),
+        whiskerprops=dict(linewidth=0.9),
+        capprops=dict(linewidth=0.9),
+        flierprops=dict(marker="o", markersize=3, markerfacecolor="grey",
+                        markeredgecolor="none"),
+    )
+    for patch, color in zip(bp["boxes"], colors):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.7)
+
+    for i, c in enumerate(cols, start=1):
+        vals = df[c].dropna().values
+        x = np.random.default_rng(42).normal(i, 0.04, size=len(vals))
+        ax.scatter(x, vals, s=6, color="black", alpha=0.25, zorder=3)
+
+    ax.set_ylabel("Test AUC")
+    ax.set_title("Cross-modal ablation (late fusion)")
+    ax.grid(axis="y", linestyle=":", alpha=0.4)
+    ax.set_axisbelow(True)
+    fig.tight_layout()
+
+    box_path = os.path.join(figures_dir, "ablation_boxplot.pdf")
+    fig.savefig(box_path, bbox_inches="tight")
+    fig.savefig(box_path.replace(".pdf", ".png"), dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Wrote {box_path}")
+    print(f"Wrote {box_path.replace('.pdf', '.png')}")
+
+    # --- bar chart of the three deltas ---
+    delta_cols   = ["delta_zero", "delta_shuffle", "delta_cough"]
+    delta_labels = ["Intact – Zero", "Intact – Shuffle", "Intact – Cough"]
+    means = [df[c].mean() for c in delta_cols]
+    stds  = [df[c].std()  for c in delta_cols]
+
+    fig, ax = plt.subplots(figsize=(6.5, 4.2))
+    x = np.arange(len(delta_cols))
+    bars = ax.bar(x, means, yerr=stds, capsize=5,
+                  color=["#DD8452", "#55A868", "#C44E52"],
+                  alpha=0.75, edgecolor="black", linewidth=0.9)
+    ax.axhline(0, color="black", linewidth=0.8)
+    ax.set_xticks(x)
+    ax.set_xticklabels(delta_labels)
+    ax.set_ylabel(r"$\Delta$ AUC (intact minus ablated)")
+    ax.set_title("Effect of removing the second branch")
+    ax.grid(axis="y", linestyle=":", alpha=0.4)
+    ax.set_axisbelow(True)
+
+    for b, m in zip(bars, means):
+        ax.text(b.get_x() + b.get_width() / 2, m,
+                f"{m:+.3f}",
+                ha="center", va="bottom" if m >= 0 else "top",
+                fontsize=9)
+
+    fig.tight_layout()
+    delta_path = os.path.join(figures_dir, "ablation_deltas.pdf")
+    fig.savefig(delta_path, bbox_inches="tight")
+    fig.savefig(delta_path.replace(".pdf", ".png"), dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Wrote {delta_path}")
+    print(f"Wrote {delta_path.replace('.pdf', '.png')}")
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +434,7 @@ def main():
     args = parser.parse_args()
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(FIGURES_DIR, exist_ok=True)
 
     if args.fold is not None:
         pairs = [(args.fold[0], args.fold[1])]
@@ -384,7 +471,7 @@ def main():
     df.to_csv(per_fold_path, index=False)
     print(f"\nWrote {per_fold_path}")
 
-    # Summary
+    # --- summary ---
     cols = ["auc_intact", "auc_zero", "auc_shuffle", "auc_cough",
             "delta_zero", "delta_shuffle", "delta_cough"]
     summary = pd.DataFrame({
@@ -400,19 +487,25 @@ def main():
     print(summary.to_string())
     print(f"\nFold pairs completed: {len(df)} / {len(pairs)}")
 
-    # Interpretation
+    # --- interpretation ---
     print("\n" + "=" * 70)
     print("INTERPRETATION")
     print("=" * 70)
     d_zero    = df["delta_zero"].mean()
     d_shuffle = df["delta_shuffle"].mean()
     d_cough   = df["delta_cough"].mean()
-    print(f"Intact  - zero    = {d_zero:+.4f}   "
+    print(f"Intact - zero    = {d_zero:+.4f}   "
           f"(positive: model uses the second branch)")
-    print(f"Intact  - shuffle = {d_shuffle:+.4f}   "
+    print(f"Intact - shuffle = {d_shuffle:+.4f}   "
           f"(positive: model uses real speech, not just the branch bias)")
-    print(f"Intact  - cough   = {d_cough:+.4f}   "
+    print(f"Intact - cough   = {d_cough:+.4f}   "
           f"(positive: speech adds beyond a second view of cough)")
+
+    # --- plots ---
+    try:
+        make_ablation_plots(df, FIGURES_DIR)
+    except Exception as exc:
+        print(f"\nPlot generation failed: {type(exc).__name__}: {exc}")
 
 
 if __name__ == "__main__":
