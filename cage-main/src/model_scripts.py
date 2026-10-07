@@ -136,7 +136,26 @@ class LateFusion(nn.Module):
             {"params": self.fusion_head.parameters(),
              "lr": base_lr * 10, "weight_decay": weight_decay},
         ]
+class BottleneckLateFusion(nn.Module):
+    def __init__(self, num_classes=2, use_pretrained=True, dropout_p=0.3):
+        super().__init__()
+        # 1. Cough Backbone (Modified to output features, not logits)
+        weights = ResNet18_Weights.IMAGENET1K_V1 if use_pretrained else None
+        self.cough_backbone = resnet18(weights=weights)
+        self.cough_backbone.fc = nn.Identity() # Bypasses the classification head, outputs 512-dim
+        
+        # 2. No speech backbone needed; we use the 128-dim tensor directly.
+        
+        # 3. Fusion Head: 512 (Cough) + 128 (Speech) = 640
+        self.fusion_head = nn.Sequential(
+            nn.Dropout(p=dropout_p),
+            nn.Linear(640, num_classes)
+        )
 
+    def forward(self, cough, speech):
+        cough_features = self.cough_backbone(cough)                  # [Batch, 512]
+        fused_features = torch.cat([cough_features, speech], dim=1)  # [Batch, 640]
+        return self.fusion_head(fused_features)                      # [Batch, 2]
 
 def _save_predictions(dev_preds, test_preds, params, predictions_dir):
     """Persist per-patient predictions for downstream analysis."""
