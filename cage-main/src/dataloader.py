@@ -241,7 +241,13 @@ class LateFusionDataset(Dataset):
         else:
             speech = s_raw
         speech = (speech - speech.mean()) / (speech.std() + 1e-8)
-
+        '''#This is an anblation study to check if speech actually helps
+        if c_raw.ndim == 2:
+            c_raw = c_raw.mean(dim=1)
+        else:
+            c_raw = c_raw
+        c_raw = (c_raw - c_raw.mean()) / (c_raw.std() + 1e-8)'''
+        
         return c_3ch, speech, label, pid
 
 

@@ -25,7 +25,7 @@ def per_config_summary(df):
     if best.empty:
         return pd.DataFrame()
 
-    group_cols = ["fusion", "arch", "lr", "wd", "aug", "use_pretrained"]
+    group_cols = ["fusion", "arch", "lr", "wd", "augmentation", "use_pretrained"]
     grouped = best.groupby(group_cols).agg(
         AUC_mean=("test_auc",  "mean"),  AUC_std=("test_auc",  "std"),
         Acc_mean=("test_acc",  "mean"),  Acc_std=("test_acc",  "std"),
@@ -59,7 +59,7 @@ def threshold_sweep(predictions_dir=PREDICTIONS_DIR,
             "fusion":     df["fusion"].iloc[0],
             "arch":       df["arch"].iloc[0],
             "lr":         df["lr"].iloc[0],
-            "aug":        df["aug"].iloc[0],
+            "augmentation": df["aug"].iloc[0],
             "pretrained": df["pretrained"].iloc[0],
         }
         y_true = per_patient["true_label"].values
@@ -103,7 +103,7 @@ def main():
                 (sweep["fusion"]     == best["fusion"]) &
                 (sweep["arch"]       == best["arch"]) &
                 (sweep["lr"]         == best["lr"]) &
-                (sweep["aug"]        == best["aug"]) &
+                (sweep["augmentation"]        == best["augmentation"]) &
                 (sweep["pretrained"] == best["use_pretrained"])
             )
             print("\nBest config threshold sweep:")
